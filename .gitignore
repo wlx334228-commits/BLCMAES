@@ -1,0 +1,6 @@
+# macOS Finder metadata
+.DS_Store
+
+# Generated MATLAB experiment outputs
+*.mat
+results/
