@@ -4,3 +4,4 @@
 # Generated MATLAB experiment outputs
 *.mat
 results/
+mean_trajectory_logs/

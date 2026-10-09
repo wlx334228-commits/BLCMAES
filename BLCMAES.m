@@ -19,9 +19,28 @@ llFunctionEvaluations = 0;
 elite = [];
 record = [];
 CMA = initCMAES(BI);
+% Optional mean-trajectory logging. This is read-only bookkeeping and is
+% disabled unless BI.meanTrajectoryDiagnostic.enabled is explicitly true.
+meanTrajectoryDiagnostic = initializeMeanTrajectoryDiagnostic(BI);
+if meanTrajectoryDiagnostic.enabled
+    meanTrajectoryDiagnostic = appendMeanTrajectoryDiagnostic( ...
+        meanTrajectoryDiagnostic, 0, CMA);
+end
+% Optional per-generation experiment log. This is read-only bookkeeping and
+% is disabled unless BI.generationDiagnostic.enabled is explicitly true.
+generationDiagnostic = initializeGenerationDiagnostic(BI);
+if generationDiagnostic.enabled
+    generationDiagnostic = appendInitialGenerationDiagnostic( ...
+        generationDiagnostic, CMA, ulFunctionEvaluations, llFunctionEvaluations);
+end
 maxIter = ceil(BI.UmaxFEs/CMA.lambda);
 ImprIter = ceil(BI.UmaxImprFEs/CMA.lambda);
 for iter = 1 : maxIter
+    if generationDiagnostic.enabled
+        % This snapshots the real lower-level counter before the original
+        % generation work begins; it does not alter the counter or RNG state.
+        LFEAtGenerationStart = llFunctionEvaluations;
+    end
     % sampling
     for i = 1 : CMA.lambda
         U = CMA.xmean + CMA.sigma * randn(1,BI.dim) .* CMA.D * CMA.B';
@@ -81,9 +100,35 @@ for iter = 1 : maxIter
         if reachTheTarget_b
             elite = bestIndv;
         end
+        % The original code does not execute updateCMAES on a terminating
+        % generation.  Log its real, pre-update mean and mark that fact.
+        if generationDiagnostic.enabled
+            generationDiagnostic = appendGenerationDiagnostic( ...
+                generationDiagnostic, iter, CMA, POP, bestIndv, bestIdx, elite, BI, ...
+                ulFunctionEvaluations, llFunctionEvaluations, ...
+                LFEAtGenerationStart, false, []);
+        end
         break;
     end
-    CMA = updateCMAES(CMA,POP,BI);
+    if generationDiagnostic.enabled
+        % updateInfo is copied from the exact ranking already used by the
+        % original CMA-ES update.  It is only returned for logging.
+        [CMA,updateInfo] = updateCMAES(CMA,POP,BI);
+    else
+        CMA = updateCMAES(CMA,POP,BI);
+    end
+    if meanTrajectoryDiagnostic.enabled
+        meanTrajectoryDiagnostic = appendMeanTrajectoryDiagnostic( ...
+            meanTrajectoryDiagnostic, iter, CMA);
+    end
+    if generationDiagnostic.enabled
+        % POP and elite remain the already-evaluated state of this generation;
+        % CMA now contains the unmodified algorithm's post-update mean/sigma.
+        generationDiagnostic = appendGenerationDiagnostic( ...
+            generationDiagnostic, iter, CMA, POP, bestIndv, bestIdx, elite, BI, ...
+            ulFunctionEvaluations, llFunctionEvaluations, ...
+            LFEAtGenerationStart, true, updateInfo);
+    end
 end
 
 ins.UF = elite.UF;
@@ -93,6 +138,21 @@ ins.LX = elite.LX;
 ins.UFEs = ulFunctionEvaluations;
 ins.LFEs = llFunctionEvaluations;
 ins.record = record;
+if meanTrajectoryDiagnostic.enabled
+    ins.meanTrajectory = meanTrajectoryDiagnostic.rows;
+    ins.meanTrajectoryColumns = meanTrajectoryDiagnostic.columns;
+end
+if generationDiagnostic.enabled
+    ins.generationLog = generationDiagnostic.rows;
+    ins.generationLogColumns = generationDiagnostic.columns;
+    ins.generationLogState.covariances = generationDiagnostic.covariances;
+    ins.generationLogState.updateEliteIndices = ...
+        generationDiagnostic.updateEliteIndices;
+    ins.generationLogState.updateEliteWeights = ...
+        generationDiagnostic.updateEliteWeights;
+    ins.generationLogState.generationBestIndices = ...
+        generationDiagnostic.generationBestIndices;
+end
 
 function cfit_ = combineConstraintWithFitness(fit_,c)
 if all(c==0)
@@ -249,8 +309,14 @@ CMA.xmean = (BI.xrange(2,:)-BI.xrange(1,:)).*rand(1,BI.dim)+BI.xrange(1,:);
 CMA.cy = sqrt(BI.dim)+2*BI.dim/(BI.dim+2);
 CMA.delta_sigma_max = 1;
 
-function CMA = updateCMAES(CMA,POP,BI)
-[~, Xindex] = sort(-[POP.fit]);
+function [CMA,updateInfo] = updateCMAES(CMA,POP,BI)
+	[~, Xindex] = sort(-[POP.fit]);
+	if nargout > 1
+		% These are the exact population indices and weights used below for
+		% the original mean/covariance update.  Returning them is read-only.
+		updateInfo.eliteIndices = Xindex(1:CMA.mu);
+		updateInfo.eliteWeights = CMA.weights;
+	end
 xold = CMA.xmean;
 X = cell2mat(arrayfun(@(p)[p.UX p.LX],POP(Xindex(1:CMA.mu))','UniformOutput',false));
 Y = bsxfun(@minus,X,xold)/CMA.sigma;
@@ -299,3 +365,206 @@ if Model.sigma > 1e7 * max(Model.D)
     Model.pc = Model.pc * fac;
     Model.C = Model.C * fac^2;
 end
+
+function diagnostic = initializeMeanTrajectoryDiagnostic(BI)
+diagnostic.enabled = false;
+diagnostic.rows = zeros(0,3);
+diagnostic.columns = {'generation','m1','m2'};
+
+if ~isfield(BI,'meanTrajectoryDiagnostic')
+    return;
+end
+
+diagnostic = BI.meanTrajectoryDiagnostic;
+if ~isfield(diagnostic,'enabled') || ~diagnostic.enabled
+    diagnostic.enabled = false;
+    return;
+end
+if BI.u_dim ~= 2
+    error('Mean-trajectory diagnostics require exactly two upper variables.');
+end
+
+diagnostic.enabled = true;
+diagnostic.rows = zeros(0,3);
+diagnostic.columns = {'generation','m1','m2'};
+
+function diagnostic = appendMeanTrajectoryDiagnostic(diagnostic, generation, CMA)
+% Called only after a completed upper-level mean update (plus generation 0).
+% It only reads the first two coordinates of CMA.xmean.
+diagnostic.rows(end+1,:) = [generation, CMA.xmean(1:2)];
+
+function diagnostic = initializeGenerationDiagnostic(BI)
+% Pure logging configuration. It is inactive by default, and its helpers only
+% read variables already produced by the original BL-CMA-ES implementation.
+diagnostic.enabled = false;
+diagnostic.rows = zeros(0,0);
+diagnostic.columns = {};
+
+if ~isfield(BI,'generationDiagnostic')
+    return;
+end
+
+settings = BI.generationDiagnostic;
+if ~isfield(settings,'enabled') || ~settings.enabled
+    return;
+end
+
+diagnostic.enabled = true;
+diagnostic.uDim = BI.u_dim;
+diagnostic.lDim = BI.l_dim;
+nextColumn = 1;
+diagnostic.generationColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.UFEColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.LFETotalColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.LFEGenerationColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.meanColumns = nextColumn:(nextColumn + BI.u_dim - 1);
+nextColumn = nextColumn + BI.u_dim;
+diagnostic.sigmaColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.generationBestFColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.bestSoFarFColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.generationBestXuColumns = nextColumn:(nextColumn + BI.u_dim - 1);
+nextColumn = nextColumn + BI.u_dim;
+diagnostic.bestSoFarXuColumns = nextColumn:(nextColumn + BI.u_dim - 1);
+nextColumn = nextColumn + BI.u_dim;
+diagnostic.populationFMinColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.populationFMedianColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.populationFStdColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.eliteWeightedFColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.feasibleRatioColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.populationCVMinColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.populationCVMedianColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.generationBestCVColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.pcNormColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.psNormColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.condCColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.eigMinCColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.eigMaxCColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.generationBestLLFColumn = nextColumn; nextColumn = nextColumn + 1;
+diagnostic.generationBestXlColumns = nextColumn:(nextColumn + BI.l_dim - 1);
+nextColumn = nextColumn + BI.l_dim;
+diagnostic.meanUpdateAppliedColumn = nextColumn;
+
+meanNames = arrayfun(@(idx)sprintf('m%d',idx),1:BI.u_dim, ...
+                     'UniformOutput',false);
+generationBestXuNames = arrayfun(@(idx)sprintf('generation_best_xu%d',idx), ...
+                                 1:BI.u_dim,'UniformOutput',false);
+bestSoFarXuNames = arrayfun(@(idx)sprintf('best_so_far_xu%d',idx), ...
+                            1:BI.u_dim,'UniformOutput',false);
+generationBestXlNames = arrayfun(@(idx)sprintf('generation_best_xl%d',idx), ...
+                                 1:BI.l_dim,'UniformOutput',false);
+diagnostic.columns = [ ...
+    {'generation','UFE','LFE_total','LFE_generation'}, meanNames, ...
+    {'sigma','generation_best_F','best_so_far_F'}, ...
+    generationBestXuNames, bestSoFarXuNames, ...
+    {'population_F_min','population_F_median','population_F_std', ...
+     'elite_weighted_F','feasible_ratio','population_CV_min', ...
+     'population_CV_median','generation_best_CV','pc_norm','ps_norm', ...
+     'cond_C','eig_min_C','eig_max_C','generation_best_LL_F'}, ...
+    generationBestXlNames, {'mean_update_applied'}];
+diagnostic.rows = NaN(0,length(diagnostic.columns));
+diagnostic.covariances = cell(0,1);
+diagnostic.updateEliteIndices = cell(0,1);
+diagnostic.updateEliteWeights = cell(0,1);
+diagnostic.generationBestIndices = zeros(0,1);
+% Unlike the optimizer's mutable elite, this snapshot is only used to report
+% the literal historical best according to the same original comparator.
+diagnostic.bestSoFar = [];
+
+function diagnostic = appendInitialGenerationDiagnostic(diagnostic, CMA, UFE, LFE_total)
+% Generation 0 has a defined initial search state, but it has no evaluated
+% population, no elite, and hence no current-generation quality metrics.
+row = NaN(1,length(diagnostic.columns));
+row(diagnostic.generationColumn) = 0;
+row(diagnostic.UFEColumn) = UFE;
+row(diagnostic.LFETotalColumn) = LFE_total;
+row(diagnostic.meanColumns) = CMA.xmean(1:diagnostic.uDim);
+row(diagnostic.sigmaColumn) = CMA.sigma;
+row = assignCMAStateSummary(row,diagnostic,CMA);
+diagnostic = appendGenerationDiagnosticState( ...
+    diagnostic,row,CMA,[],[],NaN);
+
+function diagnostic = appendGenerationDiagnostic(diagnostic, generation, CMA, POP, generationBest, generationBestIndex, elite, BI, UFE, LFE_total, LFEAtGenerationStart, meanUpdateApplied, updateInfo)
+% generationBest/best index come from the original RF-aware selection.  The
+% update elite information is captured from the original updateCMAES sorting.
+populationF = [POP.UF];
+populationCV = getPopulationConstraintViolations(POP,BI);
+
+% The optimizer's elite can be re-refined in later generations.  Keep a
+% separate read-only snapshot so best_so_far means the literal historical best
+% under the original constraint-aware upperLevelComparator.  Both original
+% sources of an evaluated elite candidate are considered: the RF-aware current
+% best and the possibly re-refined optimizer elite.
+diagnostic = updateDiagnosticBestSoFar(diagnostic,generationBest,BI);
+diagnostic = updateDiagnosticBestSoFar(diagnostic,elite,BI);
+bestSoFar = diagnostic.bestSoFar;
+
+if meanUpdateApplied
+    eliteIndices = updateInfo.eliteIndices;
+    eliteWeights = updateInfo.eliteWeights;
+    eliteWeightedF = sum(eliteWeights .* [POP(eliteIndices).UF]);
+else
+    % The original algorithm does not call updateCMAES on its terminating
+    % generation, so no elite group actually pushes a mean update there.
+    eliteIndices = [];
+    eliteWeights = [];
+    eliteWeightedF = NaN;
+end
+row = NaN(1,length(diagnostic.columns));
+row(diagnostic.generationColumn) = generation;
+row(diagnostic.UFEColumn) = UFE;
+row(diagnostic.LFETotalColumn) = LFE_total;
+row(diagnostic.LFEGenerationColumn) = LFE_total - LFEAtGenerationStart;
+row(diagnostic.meanColumns) = CMA.xmean(1:diagnostic.uDim);
+row(diagnostic.sigmaColumn) = CMA.sigma;
+row(diagnostic.generationBestFColumn) = generationBest.UF;
+row(diagnostic.bestSoFarFColumn) = bestSoFar.UF;
+row(diagnostic.generationBestXuColumns) = generationBest.UX(1:diagnostic.uDim);
+row(diagnostic.bestSoFarXuColumns) = bestSoFar.UX(1:diagnostic.uDim);
+row(diagnostic.populationFMinColumn) = min(populationF);
+row(diagnostic.populationFMedianColumn) = median(populationF);
+row(diagnostic.populationFStdColumn) = std(populationF,0);
+row(diagnostic.eliteWeightedFColumn) = eliteWeightedF;
+row(diagnostic.feasibleRatioColumn) = mean(populationCV == 0);
+row(diagnostic.populationCVMinColumn) = min(populationCV);
+row(diagnostic.populationCVMedianColumn) = median(populationCV);
+row(diagnostic.generationBestCVColumn) = populationCV(generationBestIndex);
+row(diagnostic.generationBestLLFColumn) = generationBest.LF;
+row(diagnostic.generationBestXlColumns) = generationBest.LX(1:diagnostic.lDim);
+row(diagnostic.meanUpdateAppliedColumn) = meanUpdateApplied;
+row = assignCMAStateSummary(row,diagnostic,CMA);
+diagnostic = appendGenerationDiagnosticState( ...
+    diagnostic,row,CMA,eliteIndices,eliteWeights,generationBestIndex);
+
+function populationCV = getPopulationConstraintViolations(POP,BI)
+% This is exactly the existing CV expression in assignUpperFitness, read from
+% already evaluated UC/LC fields.  It does not call an objective or optimizer.
+populationCV = [POP.UC];
+if ~BI.isLowerLevelConstraintsIncludedInUpperLevel
+    populationCV = populationCV + [POP.LC];
+end
+
+function diagnostic = updateDiagnosticBestSoFar(diagnostic,candidate,BI)
+if isempty(candidate)
+    return;
+end
+if isempty(diagnostic.bestSoFar) || ...
+        upperLevelComparator(candidate,diagnostic.bestSoFar,BI)
+    diagnostic.bestSoFar = candidate;
+end
+
+function row = assignCMAStateSummary(row,diagnostic,CMA)
+% cond/eig are numerical summaries of the existing C only; they do not affect
+% the optimizer state, its covariance update, or any function-evaluation count.
+eigenvalues = eig(CMA.C);
+row(diagnostic.pcNormColumn) = norm(CMA.pc);
+row(diagnostic.psNormColumn) = norm(CMA.ps);
+row(diagnostic.condCColumn) = cond(CMA.C);
+row(diagnostic.eigMinCColumn) = min(real(eigenvalues));
+row(diagnostic.eigMaxCColumn) = max(real(eigenvalues));
+
+function diagnostic = appendGenerationDiagnosticState(diagnostic,row,CMA,updateEliteIndices,updateEliteWeights,generationBestIndex)
+diagnostic.rows(end+1,:) = row;
+diagnostic.covariances{end+1,1} = CMA.C;
+diagnostic.updateEliteIndices{end+1,1} = updateEliteIndices;
+diagnostic.updateEliteWeights{end+1,1} = updateEliteWeights;
+diagnostic.generationBestIndices(end+1,1) = generationBestIndex;
