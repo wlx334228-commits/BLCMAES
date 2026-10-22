@@ -5,3 +5,8 @@
 *.mat
 results/
 mean_trajectory_logs/
+results_prediction_comparison/
+results_prediction_tests/
+results_population_detail/
+results_prediction_comparison(1)/
+outputs/

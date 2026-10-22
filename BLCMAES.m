@@ -11,6 +11,8 @@
 % 2017/11/15 modify some termination criteria
 
 function ins = BLCMAES(BI)
+predictionOptions = predictionCorrectionOptions(BI);
+predictionState = [];
 global ulFunctionEvaluations;
 global llFunctionEvaluations;
 ulFunctionEvaluations = 0;
@@ -36,6 +38,10 @@ end
 maxIter = ceil(BI.UmaxFEs/CMA.lambda);
 ImprIter = ceil(BI.UmaxImprFEs/CMA.lambda);
 for iter = 1 : maxIter
+    if predictionOptions.logEnabled
+        % The centre that generates population iter; never a future mean.
+        predictionMeanBefore = CMA.xmean(1:BI.u_dim);
+    end
     if generationDiagnostic.enabled
         % This snapshots the real lower-level counter before the original
         % generation work begins; it does not alter the counter or RNG state.
@@ -80,6 +86,12 @@ for iter = 1 : maxIter
     end
     % re-assign fitness
     POP = assignUpperFitness(POP,BI);
+    if generationDiagnostic.enabled
+        % Save the final, already-evaluated population that this generation
+        % supplies to the original termination check and CMA-ES update.
+        generationDiagnostic = appendGenerationPopulationDiagnostic( ...
+            generationDiagnostic,iter,POP);
+    end
     % [elite.UF elite.LF CMA.sigma]
 %     [ CMA.xmean CMA.sigma]
     % [elite.UF elite.LF elite.UC elite.LC CMA.sigma ]
@@ -108,6 +120,12 @@ for iter = 1 : maxIter
                 ulFunctionEvaluations, llFunctionEvaluations, ...
                 LFEAtGenerationStart, false, []);
         end
+        if predictionOptions.logEnabled
+            [CMA,predictionState] = applyUpperPredictionCorrection( ...
+                CMA,predictionMeanBefore,POP,iter,BI,predictionOptions, ...
+                predictionState,false,bestIndv.UF,elite.UF, ...
+                ulFunctionEvaluations,llFunctionEvaluations);
+        end
         break;
     end
     if generationDiagnostic.enabled
@@ -117,13 +135,21 @@ for iter = 1 : maxIter
     else
         CMA = updateCMAES(CMA,POP,BI);
     end
+    if predictionOptions.logEnabled
+        % Original mean, paths, covariance, sigma and eigensystem are already
+        % updated above. Only the upper sampling centre may change here.
+        [CMA,predictionState] = applyUpperPredictionCorrection( ...
+            CMA,predictionMeanBefore,POP,iter,BI,predictionOptions, ...
+            predictionState,true,bestIndv.UF,elite.UF, ...
+            ulFunctionEvaluations,llFunctionEvaluations);
+    end
     if meanTrajectoryDiagnostic.enabled
         meanTrajectoryDiagnostic = appendMeanTrajectoryDiagnostic( ...
             meanTrajectoryDiagnostic, iter, CMA);
     end
     if generationDiagnostic.enabled
         % POP and elite remain the already-evaluated state of this generation;
-        % CMA now contains the unmodified algorithm's post-update mean/sigma.
+        % CMA contains the actual next sampling mean and updated sigma.
         generationDiagnostic = appendGenerationDiagnostic( ...
             generationDiagnostic, iter, CMA, POP, bestIndv, bestIdx, elite, BI, ...
             ulFunctionEvaluations, llFunctionEvaluations, ...
@@ -138,6 +164,10 @@ ins.LX = elite.LX;
 ins.UFEs = ulFunctionEvaluations;
 ins.LFEs = llFunctionEvaluations;
 ins.record = record;
+if predictionOptions.logEnabled
+    ins.predictionLog = predictionState.log;
+    ins.predictionOptions = predictionOptions;
+end
 if meanTrajectoryDiagnostic.enabled
     ins.meanTrajectory = meanTrajectoryDiagnostic.rows;
     ins.meanTrajectoryColumns = meanTrajectoryDiagnostic.columns;
@@ -152,6 +182,8 @@ if generationDiagnostic.enabled
         generationDiagnostic.updateEliteWeights;
     ins.generationLogState.generationBestIndices = ...
         generationDiagnostic.generationBestIndices;
+    ins.generationPopulationLog = generationDiagnostic.populationRows;
+    ins.generationPopulationLogColumns = generationDiagnostic.populationColumns;
 end
 
 function cfit_ = combineConstraintWithFitness(fit_,c)
@@ -462,6 +494,15 @@ diagnostic.columns = [ ...
      'cond_C','eig_min_C','eig_max_C','generation_best_LL_F'}, ...
     generationBestXlNames, {'mean_update_applied'}];
 diagnostic.rows = NaN(0,length(diagnostic.columns));
+diagnostic.populationGenerationColumn = 1;
+diagnostic.populationIndividualIndexColumn = 2;
+diagnostic.populationXuColumns = 3:(BI.u_dim + 2);
+diagnostic.populationUFColumn = BI.u_dim + 3;
+populationXuNames = arrayfun(@(idx)sprintf('xu%d',idx),1:BI.u_dim, ...
+                             'UniformOutput',false);
+diagnostic.populationColumns = [ ...
+    {'generation','individual_index'}, populationXuNames, {'UF'}];
+diagnostic.populationRows = NaN(0,length(diagnostic.populationColumns));
 diagnostic.covariances = cell(0,1);
 diagnostic.updateEliteIndices = cell(0,1);
 diagnostic.updateEliteWeights = cell(0,1);
@@ -534,6 +575,20 @@ row(diagnostic.meanUpdateAppliedColumn) = meanUpdateApplied;
 row = assignCMAStateSummary(row,diagnostic,CMA);
 diagnostic = appendGenerationDiagnosticState( ...
     diagnostic,row,CMA,eliteIndices,eliteWeights,generationBestIndex);
+
+function diagnostic = appendGenerationPopulationDiagnostic(diagnostic,generation,POP)
+% POP already contains the upper vector and its real upper objective value
+% after the original lower-level search (and any original refinement).  This
+% helper only copies those fields into one row per population member.
+populationSize = length(POP);
+rows = NaN(populationSize,length(diagnostic.populationColumns));
+rows(:,diagnostic.populationGenerationColumn) = generation;
+rows(:,diagnostic.populationIndividualIndexColumn) = (1:populationSize)';
+for i = 1:populationSize
+    rows(i,diagnostic.populationXuColumns) = POP(i).UX(1:diagnostic.uDim);
+    rows(i,diagnostic.populationUFColumn) = POP(i).UF;
+end
+diagnostic.populationRows = [diagnostic.populationRows; rows];
 
 function populationCV = getPopulationConstraintViolations(POP,BI)
 % This is exactly the existing CV expression in assignUpperFitness, read from
