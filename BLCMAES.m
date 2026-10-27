@@ -11,8 +11,26 @@
 % 2017/11/15 modify some termination criteria
 
 function ins = BLCMAES(BI)
-predictionOptions = predictionCorrectionOptions(BI);
+% Prediction variants are intentionally mutually exclusive.  The injection
+% variant evaluates external candidates but never directly changes CMA.xmean.
+meanPredictionOptions = predictionCorrectionOptions(BI);
+individualPredictionOptions = individualPredictionCorrectionOptions(BI);
+injectionPredictionOptions = predictionInjectionOptions(BI);
+enabledPredictionStrategies = [meanPredictionOptions.enabled, ...
+    individualPredictionOptions.enabled,injectionPredictionOptions.enabled];
+if sum(enabledPredictionStrategies) > 1
+    error('BLCMAES:PredictionStrategyConflict', ...
+        'Only one prediction strategy may be enabled in a run.');
+end
+if injectionPredictionOptions.enabled && ...
+        (meanPredictionOptions.logEnabled || individualPredictionOptions.logEnabled)
+    error('BLCMAES:PredictionStrategyConflict', ...
+        ['Disable the old mean/individual prediction logs when using B1/B2; ' ...
+         'they would describe a different candidate population.']);
+end
 predictionState = [];
+individualPredictionState = [];
+injectionPredictionState = [];
 global ulFunctionEvaluations;
 global llFunctionEvaluations;
 ulFunctionEvaluations = 0;
@@ -38,24 +56,61 @@ end
 maxIter = ceil(BI.UmaxFEs/CMA.lambda);
 ImprIter = ceil(BI.UmaxImprFEs/CMA.lambda);
 for iter = 1 : maxIter
-    if predictionOptions.logEnabled
+    if meanPredictionOptions.logEnabled
         % The centre that generates population iter; never a future mean.
         predictionMeanBefore = CMA.xmean(1:BI.u_dim);
+    end
+    if individualPredictionOptions.logEnabled
+        % This remains the exact normal CMA-ES sampling centre.  The v2
+        % strategy never writes CMA.xmean at this or any later point.
+        individualSamplingMean = CMA.xmean(1:BI.u_dim);
+    end
+    if injectionPredictionOptions.logEnabled
+        injectionSamplingMean = CMA.xmean;
     end
     if generationDiagnostic.enabled
         % This snapshots the real lower-level counter before the original
         % generation work begins; it does not alter the counter or RNG state.
         LFEAtGenerationStart = llFunctionEvaluations;
     end
-    % sampling
+    % Normal joint-variable sampling.  Draw order and the original first
+    % boundary repair are unchanged.  V2 touches only upper coordinates after
+    % all lambda samples exist and before any true evaluation occurs.
+    sampledUpper = zeros(CMA.lambda,BI.u_dim);
+    sampledLower = zeros(CMA.lambda,BI.l_dim);
     for i = 1 : CMA.lambda
         U = CMA.xmean + CMA.sigma * randn(1,BI.dim) .* CMA.D * CMA.B';
         flag = U > BI.xrange(2,:);
         U(flag) = (CMA.xmean(flag) + BI.xrange(2,flag))/2;
         flag = U < BI.xrange(1,:);
         U(flag) = (CMA.xmean(flag) + BI.xrange(1,flag))/2;
-        POP(i).UX = U(1:BI.u_dim);
-        POP(i).LX = U(BI.u_dim+1:end);
+        sampledUpper(i,:) = U(1:BI.u_dim);
+        sampledLower(i,:) = U(BI.u_dim+1:end);
+    end
+    if individualPredictionOptions.logEnabled
+        [sampledUpper,individualPredictionEntry,individualPredictionState] = ...
+            applyIndividualPredictionCorrection(CMA,sampledUpper,sampledLower, ...
+                iter,BI,individualPredictionOptions,individualPredictionState);
+    end
+    if injectionPredictionOptions.logEnabled
+        [sampledUpper,sampledLower,injectionPredictionEntry, ...
+            injectionPredictionState] = applyPredictionInjection( ...
+                CMA,sampledUpper,sampledLower,iter,BI, ...
+                injectionPredictionOptions,injectionPredictionState);
+    end
+    for i = 1 : CMA.lambda
+        POP(i).UX = sampledUpper(i,:);
+        POP(i).LX = sampledLower(i,:);
+    end
+    if individualPredictionOptions.logEnabled
+        % This stores the exact joint coordinates that the following lower
+        % search and upper evaluation receive.  It is a read-only audit.
+        individualPredictionEntry = recordIndividualPredictionEvaluationInput( ...
+            individualPredictionEntry,POP,individualPredictionOptions);
+    end
+    if injectionPredictionOptions.logEnabled
+        injectionPredictionEntry = recordPredictionInjectionEvaluationInput( ...
+            injectionPredictionEntry,POP,injectionPredictionOptions);
     end
     % lower level search
     for i = 1 : CMA.lambda
@@ -63,6 +118,16 @@ for iter = 1 : maxIter
         [POP(i).UF,POP(i).UC] = UL_evaluate(POP(i).UX,POP(i).LX,BI.fn);
         POP(i).UFEs = ulFunctionEvaluations;
         POP(i).LFEs = llFunctionEvaluations;
+    end
+    if individualPredictionOptions.logEnabled
+        % This records the exact (UX,LX) pair after the existing lower search
+        % and immediately after its normal upper evaluation.  It is read-only.
+        individualPredictionEntry = recordIndividualPredictionTrueEvaluation( ...
+            individualPredictionEntry,POP,individualPredictionOptions);
+    end
+    if injectionPredictionOptions.logEnabled
+        injectionPredictionEntry = recordPredictionInjectionTrueEvaluation( ...
+            injectionPredictionEntry,POP);
     end
     % fitness assignment && refinement
     POP = assignUpperFitness(POP,BI);
@@ -75,17 +140,44 @@ for iter = 1 : maxIter
     bestIndv = POP(bestIdx);
 
     % replace the elite
+    % `extraRefinedElite` is populated only when the original branch refines
+    % an old elite outside POP and genuinely performs a new upper evaluation.
+    % It is archived for diagnostics/prediction, but never inserted into this
+    % generation's CMA-ES parent pool.
+    extraRefinedElite = [];
     if upperLevelComparator(bestIndv,elite,BI) || rand > 0.5
-    	bestIndv = refine(bestIndv,CMA,BI);
+        [bestIndv,~] = refine(bestIndv,CMA,BI);
     	POP(bestIdx) = bestIndv;
     	if upperLevelComparator(bestIndv,elite,BI)
     		elite = bestIndv;
     	end
     else
-    	elite = refine(elite,CMA,BI);
+        [elite,refinedOldElite] = refine(elite,CMA,BI);
+        if refinedOldElite
+            extraRefinedElite = elite;
+        end
     end
     % re-assign fitness
     POP = assignUpperFitness(POP,BI);
+    if individualPredictionOptions.logEnabled
+        % Store the actual evaluated (therefore possibly repaired) members.
+        % Fitting is delayed to here and creates only the next generation's
+        % pending prediction; it cannot leak future information backwards.
+        [individualPredictionState,individualPredictionEntry] = ...
+            finalizeIndividualPredictionCorrection( ...
+                individualPredictionState,individualPredictionEntry,POP, ...
+                individualSamplingMean,iter,BI,individualPredictionOptions, ...
+                max([POP.UF]),elite.UF,ulFunctionEvaluations, ...
+                llFunctionEvaluations);
+    end
+    if injectionPredictionOptions.logEnabled
+        [injectionPredictionState,injectionPredictionEntry] = ...
+            finalizePredictionInjection(injectionPredictionState, ...
+                injectionPredictionEntry,POP,elite,extraRefinedElite, ...
+                injectionSamplingMean,iter,BI, ...
+                injectionPredictionOptions,ulFunctionEvaluations, ...
+                llFunctionEvaluations);
+    end
     if generationDiagnostic.enabled
         % Save the final, already-evaluated population that this generation
         % supplies to the original termination check and CMA-ES update.
@@ -120,28 +212,57 @@ for iter = 1 : maxIter
                 ulFunctionEvaluations, llFunctionEvaluations, ...
                 LFEAtGenerationStart, false, []);
         end
-        if predictionOptions.logEnabled
+        if meanPredictionOptions.logEnabled
             [CMA,predictionState] = applyUpperPredictionCorrection( ...
-                CMA,predictionMeanBefore,POP,iter,BI,predictionOptions, ...
+                CMA,predictionMeanBefore,POP,iter,BI,meanPredictionOptions, ...
                 predictionState,false,bestIndv.UF,elite.UF, ...
                 ulFunctionEvaluations,llFunctionEvaluations);
         end
+        if individualPredictionOptions.logEnabled
+            individualPredictionEntry.termination_reason = ...
+                getTerminationReason(reachTheTarget_b,reachTheTarget_e, ...
+                    reachTheMaxFEs,reachTheFlat);
+            individualPredictionState = appendIndividualPredictionLog( ...
+                individualPredictionState,individualPredictionEntry,CMA,false, ...
+                [],individualPredictionOptions);
+        end
+        if injectionPredictionOptions.logEnabled
+            injectionPredictionEntry.termination_reason = ...
+                getTerminationReason(reachTheTarget_b,reachTheTarget_e, ...
+                    reachTheMaxFEs,reachTheFlat);
+            injectionPredictionState = appendPredictionInjectionLog( ...
+                injectionPredictionState,injectionPredictionEntry,CMA,false, ...
+                [],injectionPredictionOptions);
+        end
         break;
     end
-    if generationDiagnostic.enabled
+    if generationDiagnostic.enabled || individualPredictionOptions.logEnabled || ...
+            injectionPredictionOptions.logEnabled
         % updateInfo is copied from the exact ranking already used by the
         % original CMA-ES update.  It is only returned for logging.
         [CMA,updateInfo] = updateCMAES(CMA,POP,BI);
     else
         CMA = updateCMAES(CMA,POP,BI);
     end
-    if predictionOptions.logEnabled
+    if meanPredictionOptions.logEnabled
         % Original mean, paths, covariance, sigma and eigensystem are already
         % updated above. Only the upper sampling centre may change here.
         [CMA,predictionState] = applyUpperPredictionCorrection( ...
-            CMA,predictionMeanBefore,POP,iter,BI,predictionOptions, ...
+            CMA,predictionMeanBefore,POP,iter,BI,meanPredictionOptions, ...
             predictionState,true,bestIndv.UF,elite.UF, ...
             ulFunctionEvaluations,llFunctionEvaluations);
+    end
+    if individualPredictionOptions.logEnabled
+        individualPredictionEntry.termination_reason = 'continue';
+        individualPredictionState = appendIndividualPredictionLog( ...
+            individualPredictionState,individualPredictionEntry,CMA,true, ...
+            updateInfo,individualPredictionOptions);
+    end
+    if injectionPredictionOptions.logEnabled
+        injectionPredictionEntry.termination_reason = 'continue';
+        injectionPredictionState = appendPredictionInjectionLog( ...
+            injectionPredictionState,injectionPredictionEntry,CMA,true, ...
+            updateInfo,injectionPredictionOptions);
     end
     if meanTrajectoryDiagnostic.enabled
         meanTrajectoryDiagnostic = appendMeanTrajectoryDiagnostic( ...
@@ -164,9 +285,17 @@ ins.LX = elite.LX;
 ins.UFEs = ulFunctionEvaluations;
 ins.LFEs = llFunctionEvaluations;
 ins.record = record;
-if predictionOptions.logEnabled
+if meanPredictionOptions.logEnabled
     ins.predictionLog = predictionState.log;
-    ins.predictionOptions = predictionOptions;
+    ins.predictionOptions = meanPredictionOptions;
+end
+if individualPredictionOptions.logEnabled
+    ins.individualPredictionLog = individualPredictionState.log;
+    ins.individualPredictionOptions = individualPredictionOptions;
+end
+if injectionPredictionOptions.logEnabled
+    ins.predictionInjectionLog = injectionPredictionState.log;
+    ins.predictionInjectionOptions = injectionPredictionOptions;
 end
 if meanTrajectoryDiagnostic.enabled
     ins.meanTrajectory = meanTrajectoryDiagnostic.rows;
@@ -216,12 +345,14 @@ for i = 1 : length(POP)
 	% according to latest experimental results, incorporating RF here seems to be meaningless
 end
 
-function Q = refine(P,CMA,BI)
+function [Q,upperEvaluated] = refine(P,CMA,BI)
 Q = P;
+upperEvaluated = false;
 [Q.LX,Q.LF,Q.LC,Q.RF] = lowerLevelSearch(Q.UX,CMA,BI);
 if lowerLevelComparator(Q,P)
     Q.RF = max(Q.RF,P.RF);
     [Q.UF,Q.UC] = UL_evaluate(Q.UX,Q.LX,BI.fn);
+	upperEvaluated = true;
 else
 	Q = P;
 end
@@ -343,16 +474,30 @@ CMA.delta_sigma_max = 1;
 
 function [CMA,updateInfo] = updateCMAES(CMA,POP,BI)
 	[~, Xindex] = sort(-[POP.fit]);
-	if nargout > 1
-		% These are the exact population indices and weights used below for
-		% the original mean/covariance update.  Returning them is read-only.
-		updateInfo.eliteIndices = Xindex(1:CMA.mu);
-		updateInfo.eliteWeights = CMA.weights;
-	end
 xold = CMA.xmean;
 X = cell2mat(arrayfun(@(p)[p.UX p.LX],POP(Xindex(1:CMA.mu))','UniformOutput',false));
-Y = bsxfun(@minus,X,xold)/CMA.sigma;
-Y = bsxfun(@times,Y,min(1,CMA.cy./sqrt(sum((Y*CMA.invsqrtC').^2,2))));
+	% This is the project's existing length control.  It also provides the
+	% required bounded update step for any externally injected parent: its
+	% evaluated position remains X, while only its adaptive-update step is
+	% Mahalanobis-length clipped.
+YRaw = bsxfun(@minus,X,xold)/CMA.sigma;
+whitenedNorms = sqrt(sum((YRaw*CMA.invsqrtC').^2,2));
+stepScales = min(1,CMA.cy./whitenedNorms);
+Y = bsxfun(@times,YRaw,stepScales);
+	if nargout > 1
+		% These are the exact evaluated parent coordinates, indices and state
+		% used below. Returning them is audit-only and never changes CMA-ES.
+		updateInfo.eliteIndices = Xindex(1:CMA.mu);
+		updateInfo.eliteWeights = CMA.weights;
+		updateInfo.parentJoint = X;
+		updateInfo.xmeanBefore = xold;
+		updateInfo.sigmaBefore = CMA.sigma;
+		updateInfo.parentRawSteps = YRaw;
+		updateInfo.parentClippedSteps = Y;
+		updateInfo.parentWhitenedNorms = whitenedNorms;
+		updateInfo.parentStepScales = stepScales;
+		updateInfo.stepLengthLimit = CMA.cy;
+	end
 delta_xmean = CMA.weights * Y;
 CMA.xmean = CMA.xmean + delta_xmean * CMA.sigma;
 C_mu = Y' * diag(CMA.weights) * Y;
@@ -374,6 +519,21 @@ C = sum(max(0,C));
 function [F,C] = UL_evaluate(UPop,LPOP,fn)
 [F,~,C] = ulTestProblem(UPop, LPOP, fn);
 C = sum(max(0,C));
+
+function reason = getTerminationReason(reachTargetPopulation,reachTargetElite, ...
+    reachMaxFEs,reachFlat)
+%GETTERMINATIONREASON Keep the original stopping decision but expose why.
+if reachTargetPopulation
+    reason = 'population_target';
+elseif reachTargetElite
+    reason = 'elite_target';
+elseif reachMaxFEs
+    reason = 'maximum_UFE';
+elseif reachFlat
+    reason = 'flat_progress';
+else
+    reason = 'continue';
+end
 
 function Model = repairCMA(Model)
 dim = length(Model.D);
