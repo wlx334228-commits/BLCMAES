@@ -27,6 +27,10 @@ entry.direct_is_generation_best = strcmp(entry.generation_best_source, ...
     'predicted_direct');
 entry.auxiliary_is_generation_best = strcmp(entry.generation_best_source, ...
     'predicted_auxiliary');
+directIndices = find(strcmp(entry.source_labels,'predicted_direct'));
+auxiliaryIndices = find(strcmp(entry.source_labels,'predicted_auxiliary'));
+entry.direct_fitness_ranks = fitnessRank(directIndices);
+entry.auxiliary_fitness_ranks = fitnessRank(auxiliaryIndices);
 entry.new_best_so_far = populationUF(bestIndex) > previousBest;
 entry.best_so_far_UF = state.bestUF;
 entry.UFE = UFE;

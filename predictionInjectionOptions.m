@@ -1,9 +1,11 @@
 function options = predictionInjectionOptions(BI)
-%PREDICTIONINJECTIONOPTIONS Options for A0/B1/B2 external-solution injection.
-% A0 keeps the original population. B1 replaces one sampled upper point by
-% x_pred. B2 replaces two points by x_pred and an auxiliary Gaussian sample.
+%PREDICTIONINJECTIONOPTIONS Options for K=0,...,lambda prediction injection.
+% Legacy A0/B1/B2 names remain accepted: A0=K0, B1=K1, and B2=K2.
+% K>=1 replaces K normal candidates by one direct quadratic prediction and
+% K-1 private-stream auxiliary samples around that prediction.
 
-options = struct('mode','A0','enabled',false,'logEnabled',false, ...
+options = struct('mode','A0','predictionInjectCount',NaN, ...
+    'enabled',false,'logEnabled',false, ...
     'startGeneration',10,'historyGenerations',10,'sampleCount',40, ...
     'auxiliaryRandomSeed',314159,'randomSeed',NaN, ...
     'minScaleRelative',1e-12, ...
@@ -24,19 +26,44 @@ end
 if isstring(options.mode), options.mode = char(options.mode); end
 validateattributes(options.mode,{'char'},{'row'});
 options.mode = upper(strtrim(options.mode));
-validModes = {'A0','B1','B2'};
+validModes = [{'A0','B1','B2'}, ...
+    arrayfun(@(k)sprintf('K%d',k),0:8,'UniformOutput',false)];
 if ~any(strcmp(options.mode,validModes))
     error('BLCMAES:PredictionInjectionOption', ...
-        'mode must be A0, B1, or B2.');
+        'mode must be A0, B1, B2, or K0 through K8.');
 end
-options.enabled = ~strcmp(options.mode,'A0');
+
+% A numeric K is the canonical setting for the new ablation.  Do not make
+% the legacy B1/B2 scripts change behaviour: when K is omitted, their old
+% names still select exactly the old candidate layout and RNG policy.
+modeK = modeToInjectCount(options.mode);
+if isnan(options.predictionInjectCount)
+    options.predictionInjectCount = modeK;
+else
+    validateattributes(options.predictionInjectCount,{'numeric'}, ...
+        {'real','finite','scalar','integer','>=',0,'<=',8});
+    if ~strcmp(options.mode,'A0') && options.predictionInjectCount ~= modeK
+        error('BLCMAES:PredictionInjectionOption', ...
+            'mode %s conflicts with predictionInjectCount=%d.', ...
+            options.mode,options.predictionInjectCount);
+    end
+    if isfield(BI,'predictionInjection') && ...
+            ~isfield(BI.predictionInjection,'mode') && strcmp(options.mode,'A0')
+        % A caller using only the new numeric parameter still receives a
+        % self-describing log label rather than a misleading legacy A0 label.
+        options.mode = sprintf('K%d',options.predictionInjectCount);
+    end
+end
+options.enabled = options.predictionInjectCount > 0;
 options.usesPrediction = options.enabled;
+options.usesAuxiliary = options.predictionInjectCount >= 2;
 validateattributes(options.logEnabled,{'logical','numeric'},{'scalar','binary'});
 options.logEnabled = logical(options.logEnabled) || options.enabled;
 for name = {'startGeneration','historyGenerations','sampleCount'}
     validateattributes(options.(name{1}),{'numeric'}, ...
         {'real','finite','scalar','integer','positive'});
 end
+
 validateattributes(options.auxiliaryRandomSeed,{'numeric'}, ...
     {'real','finite','scalar','integer','nonnegative'});
 validateattributes(options.randomSeed,{'numeric'}, {'real','scalar'});
@@ -68,5 +95,18 @@ if options.usesPrediction || options.logEnabled
             ['Prediction injection currently supports only SMD1--SMD12 ' ...
              'with two upper variables.']);
     end
+end
+end
+
+function count = modeToInjectCount(mode)
+switch mode
+    case 'A0'
+        count = 0;
+    case 'B1'
+        count = 1;
+    case 'B2'
+        count = 2;
+    otherwise
+        count = sscanf(mode,'K%d');
 end
 end

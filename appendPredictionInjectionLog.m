@@ -6,6 +6,10 @@ entry.mean_update_applied = updateApplied;
 entry.cma_mean_after_update = CMA.xmean;
 entry.sigma_after_update = CMA.sigma;
 entry.C_after_update = CMA.C;
+eigenvalues = real(eig(CMA.C));
+entry.cond_C_after_update = cond(CMA.C);
+entry.eig_min_C_after_update = min(eigenvalues);
+entry.eig_max_C_after_update = max(eigenvalues);
 if updateApplied
     entry.selected_parent_indices = updateInfo.eliteIndices;
     entry.selected_parent_joint = updateInfo.parentJoint;
@@ -14,6 +18,12 @@ if updateApplied
         'predicted_direct'));
     entry.auxiliary_parent_selected = any(strcmp(entry.selected_parent_sources, ...
         'predicted_auxiliary'));
+    entry.direct_parent_count = sum(strcmp(entry.selected_parent_sources, ...
+        'predicted_direct'));
+    entry.auxiliary_parent_count = sum(strcmp(entry.selected_parent_sources, ...
+        'predicted_auxiliary'));
+    entry.normal_parent_count = sum(strcmp(entry.selected_parent_sources, ...
+        'normal'));
     entry.parent_raw_steps = updateInfo.parentRawSteps;
     entry.parent_clipped_steps = updateInfo.parentClippedSteps;
     entry.parent_whitened_norms = updateInfo.parentWhitenedNorms;
