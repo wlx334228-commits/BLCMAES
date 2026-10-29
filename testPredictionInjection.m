@@ -1,5 +1,5 @@
 function report = testPredictionInjection(outputDir)
-%TESTPREDICTIONINJECTION Validate K=0,1,2,4,8 injection bookkeeping.
+%TESTPREDICTIONINJECTION Validate direct and auxiliary-only K bookkeeping.
 % The test has no benchmark-result claim.  It checks candidate placement,
 % private auxiliary RNG use, LL/UL input consistency and legacy B1/B2
 % equivalence before a full K=0,...,8 experiment is launched.
@@ -42,6 +42,36 @@ for K = [0 1 2 4 8]
         assert(isequal(entry.auxiliary_indices,(directIndex+1):8));
     end
     synthetic.(sprintf('K%d',K)) = entry;
+end
+
+% Auxiliary-only policy: all K replacement slots must be samples from the
+% prediction-centred distribution.  The prediction itself is never a POP
+% member, including K=1.
+auxiliaryOnlySynthetic = struct();
+for K = [0 1 2 4 8]
+    options = predictionInjectionOptions(withCount( ...
+        BI,K,true,'auxiliary_only'));
+    state = initializePredictionInjectionState(BI,options);
+    state.pending = pendingPrediction(BI);
+    rngBefore = rng;
+    [upper,lower,entry] = applyPredictionInjection(CMA,rawUpper,rawLower, ...
+        11,BI,options,state);
+    assert(isequal(rngBefore,rng), ...
+        'Auxiliary-only K=%d changed the global random sequence.',K);
+    assert(sum(strcmp(entry.source_labels,'normal')) == 8-K);
+    assert(sum(strcmp(entry.source_labels,'predicted_direct')) == 0);
+    assert(sum(strcmp(entry.source_labels,'predicted_auxiliary')) == K);
+    assert(entry.injected_count == K && entry.effective_injected_count == K);
+    if K == 0
+        assert(isequal(upper,rawUpper) && isequal(lower,rawLower));
+    else
+        assert(isnan(entry.direct_index));
+        assert(isequal(entry.auxiliary_indices,(9-K):8));
+        centreDifference = abs(entry.auxiliary_mean(:,1:BI.u_dim) - ...
+            repmat([0.5,-0.5],K,1));
+        assert(all(centreDifference(:) < 1e-12));
+    end
+    auxiliaryOnlySynthetic.(sprintf('K%d',K)) = entry;
 end
 
 % K=1 and K=2 must keep the previously published B1/B2 candidate layouts.
@@ -99,6 +129,43 @@ for K = [0 1 2 4 8]
         'consistencyPassed',all([log.consistency_passed]));
 end
 
+% The real LL/UL path receives the auxiliary-only coordinates, and the
+% prediction itself is never labelled or evaluated as a direct candidate.
+auxiliaryOnlyIntegration = struct();
+for K = [0 1 2 4 8]
+    BIrun = withCount(baseBI,K,true,'auxiliary_only');
+    rng(1,'twister');
+    ins = BLCMAES(BIrun);
+    log = ins.predictionInjectionLog;
+    assert(all([log.consistency_checked]) && all([log.consistency_passed]), ...
+        'Auxiliary-only consistency audit failed for K=%d.',K);
+    assert(all(arrayfun(@(item) isequal(item.upper_entering_lower_search, ...
+        item.upper_after_injection),log)), ...
+        'Auxiliary-only LL did not receive K=%d actual coordinates.',K);
+    assert(all(arrayfun(@(item) ...
+        ~any(strcmp(item.source_labels,'predicted_direct')),log)), ...
+        'Auxiliary-only K=%d created a direct prediction candidate.',K);
+    for generation = 1:min(10,numel(log))
+        assert(all(strcmp(log(generation).source_labels,'normal')), ...
+            'Auxiliary-only K=%d injected before generation 11.',K);
+    end
+    for generation = 1:numel(log)
+        item = log(generation);
+        if item.injected_count > 0
+            assert(sum(strcmp(item.source_labels,'predicted_auxiliary')) == K, ...
+                'Auxiliary-only K=%d used an incorrect auxiliary count.',K);
+        end
+        if item.mean_update_applied
+            assert(isequal(item.selected_parent_joint, ...
+                item.joint_for_cma_update(item.selected_parent_indices,:)));
+        end
+    end
+    auxiliaryOnlyIntegration.(sprintf('K%d',K)) = struct('UF',ins.UF, ...
+        'LF',ins.LF,'UFE',ins.UFEs,'LFE',ins.LFEs, ...
+        'injectedGenerations',sum([log.injected_count] > 0), ...
+        'consistencyPassed',all([log.consistency_passed]));
+end
+
 % The full optimiser must also reproduce the prior B1/B2 trajectories for
 % K=1/K=2, not merely their synthetic candidate layout.
 legacyRunEquivalence = struct();
@@ -115,8 +182,10 @@ for K = [1 2]
 end
 
 report = struct('passed',true,'synthetic',synthetic, ...
+    'auxiliaryOnlySynthetic',auxiliaryOnlySynthetic, ...
     'legacyEquivalence',legacyEquivalence, ...
-    'legacyRunEquivalence',legacyRunEquivalence,'integration',integration);
+    'legacyRunEquivalence',legacyRunEquivalence,'integration',integration, ...
+    'auxiliaryOnlyIntegration',auxiliaryOnlyIntegration);
 save(fullfile(outputDir,'prediction_injection_test_report.mat'),'report');
 disp(report);
 end
@@ -147,12 +216,16 @@ pending = struct('valid',true,'x_pred',[0.5,-0.5], ...
 assert(BI.u_dim == 2);
 end
 
-function BIout = withCount(BIin,K,consistencyCheckEnabled)
+function BIout = withCount(BIin,K,consistencyCheckEnabled,candidatePolicy)
+if nargin < 4 || isempty(candidatePolicy)
+    candidatePolicy = 'direct_plus_auxiliary';
+end
 BIout = BIin;
 BIout.enablePredictionCorrection = false;
 BIout.enableIndividualPredictionCorrection = false;
 BIout.predictionInjection = struct('mode',sprintf('K%d',K), ...
-    'predictionInjectCount',K,'logEnabled',true,'startGeneration',10, ...
+    'predictionInjectCount',K,'candidatePolicy',candidatePolicy, ...
+    'logEnabled',true,'startGeneration',10, ...
     'historyGenerations',10,'sampleCount',40,'auxiliaryRandomSeed',991, ...
     'consistencyCheckEnabled',consistencyCheckEnabled);
 end

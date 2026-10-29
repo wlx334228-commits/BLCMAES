@@ -2,9 +2,11 @@ function [upper,lower,entry,state] = applyPredictionInjection( ...
     CMA,rawUpper,rawLower,generation,BI,options,state)
 %APPLYPREDICTIONINJECTION Construct K=0,...,lambda evaluated candidates.
 % All main-distribution samples are first drawn exactly as in the original
-% code.  When a pending prediction is valid, the final K slots are replaced
-% before any lower-level or upper-level evaluation: the first is the direct
-% prediction and the other K-1 are auxiliary joint samples centred on it.
+% code. When a pending prediction is valid, the final K slots are replaced
+% before any lower-level or upper-level evaluation. The legacy
+% direct-plus-auxiliary policy uses one direct prediction and K-1 auxiliary
+% joint samples. The auxiliary-only policy uses K auxiliary joint samples,
+% with the prediction only as their upper sampling centre.
 
 populationSize = size(rawUpper,1);
 assert(size(rawUpper,2) == BI.u_dim && size(rawLower,1) == populationSize, ...
@@ -41,32 +43,54 @@ if ~isreal(xPredRequested) || numel(xPredRequested) ~= BI.u_dim || ...
 end
 
 injectCount = options.predictionInjectCount;
-directIndex = populationSize-injectCount+1;
-auxiliaryIndices = (directIndex+1):populationSize;
-[xPredActual,directRepair] = repairUpperCandidate( ...
-    xPredRequested,rawUpper(directIndex,:),BI);
-upper(directIndex,:) = xPredActual;
-entry.source_labels{directIndex} = 'predicted_direct';
-entry.direct_index = directIndex;
+injectedStart = populationSize-injectCount+1;
+if options.usesDirectPrediction
+    directIndex = injectedStart;
+    auxiliaryIndices = (directIndex+1):populationSize;
+    predictionReference = rawUpper(directIndex,:);
+else
+    directIndex = NaN;
+    auxiliaryIndices = injectedStart:populationSize;
+    % The prediction itself is not evaluated in auxiliary-only mode.  This
+    % reference is used only by the existing boundary-repair rule to form a
+    % feasible auxiliary-distribution centre.
+    predictionReference = rawUpper(auxiliaryIndices(1),:);
+end
+[xPredActual,predictionCentreRepair] = repairUpperCandidate( ...
+    xPredRequested,predictionReference,BI);
 entry.prediction_valid_used = true;
 entry.prediction_source_generation = state.pending.source_generation;
 entry.x_pred_requested = xPredRequested;
 entry.x_pred_actual = xPredActual;
-entry.direct_boundary_repaired = directRepair;
-entry.direct_requested_step = xPredRequested - ...
+entry.prediction_center_requested_step = xPredRequested - ...
     entry.cma_mean_before_sampling(1:BI.u_dim);
-entry.direct_actual_step = xPredActual - ...
+entry.prediction_center_actual_step = xPredActual - ...
     entry.cma_mean_before_sampling(1:BI.u_dim);
 entry.injection_reason = 'prediction_injected';
+
+if options.usesDirectPrediction
+    upper(directIndex,:) = xPredActual;
+    entry.source_labels{directIndex} = 'predicted_direct';
+    entry.direct_index = directIndex;
+    entry.direct_boundary_repaired = predictionCentreRepair;
+    entry.direct_requested_step = entry.prediction_center_requested_step;
+    entry.direct_actual_step = entry.prediction_center_actual_step;
+else
+    % Kept separate from direct_boundary_repaired so boundary-repair totals
+    % remain interpretable when no direct candidate exists.
+    entry.prediction_center_boundary_repaired = predictionCentreRepair;
+end
 
 if ~isempty(auxiliaryIndices)
     if isempty(state.auxiliaryStream)
         error('BLCMAES:AuxiliaryRandomStream', ...
-            'K>=2 requires its private auxiliary sampling stream.');
+            'This policy requires its private auxiliary sampling stream.');
     end
     auxiliaryMean = CMA.xmean;
-    % Use the bounded, actually injectable prediction as the auxiliary upper
-    % centre. The lower centre remains the main CMA-ES lower mean.
+    % Use the bounded prediction only as the auxiliary upper centre. The
+    % lower centre remains the main CMA-ES lower mean. In auxiliary-only
+    % mode this is the sole use of xPredActual: no population member is set
+    % equal to it directly.
     auxiliaryMean(1:BI.u_dim) = xPredActual;
     auxiliaryRaw = NaN(numel(auxiliaryIndices),BI.dim);
     auxiliaryActual = NaN(numel(auxiliaryIndices),BI.dim);
@@ -141,6 +165,7 @@ populationSize = size(rawUpper,1);
 upperDim = BI.u_dim;
 jointDim = BI.dim;
 entry = struct('generation',generation,'mode',options.mode, ...
+    'candidate_policy',options.candidatePolicy, ...
     'prediction_inject_count',options.predictionInjectCount, ...
     'random_seed',options.randomSeed, ...
     'population_size',populationSize, ...
@@ -160,6 +185,9 @@ entry = struct('generation',generation,'mode',options.mode, ...
     'injected_count',0, ...
     'injected_indices',zeros(1,0),'injection_reason','not_checked', ...
     'direct_boundary_repaired',false(1,upperDim), ...
+    'prediction_center_boundary_repaired',false(1,upperDim), ...
+    'prediction_center_requested_step',NaN(1,upperDim), ...
+    'prediction_center_actual_step',NaN(1,upperDim), ...
     'direct_requested_step',NaN(1,upperDim), ...
     'direct_actual_step',NaN(1,upperDim), ...
     'auxiliary_mean',NaN(0,jointDim), ...

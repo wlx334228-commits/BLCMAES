@@ -1,10 +1,15 @@
 function options = predictionInjectionOptions(BI)
 %PREDICTIONINJECTIONOPTIONS Options for K=0,...,lambda prediction injection.
 % Legacy A0/B1/B2 names remain accepted: A0=K0, B1=K1, and B2=K2.
-% K>=1 replaces K normal candidates by one direct quadratic prediction and
-% K-1 private-stream auxiliary samples around that prediction.
+% candidatePolicy='direct_plus_auxiliary' (the original B1/B2/K study)
+% replaces K normal candidates by one direct quadratic prediction and K-1
+% private-stream auxiliary samples around that prediction.  The new
+% candidatePolicy='auxiliary_only' replaces K normal candidates by K
+% private-stream auxiliary samples around the prediction, but never inserts
+% the prediction itself as an evaluated individual.
 
 options = struct('mode','A0','predictionInjectCount',NaN, ...
+    'candidatePolicy','direct_plus_auxiliary', ...
     'enabled',false,'logEnabled',false, ...
     'startGeneration',10,'historyGenerations',10,'sampleCount',40, ...
     'auxiliaryRandomSeed',314159,'randomSeed',NaN, ...
@@ -56,7 +61,18 @@ else
 end
 options.enabled = options.predictionInjectCount > 0;
 options.usesPrediction = options.enabled;
-options.usesAuxiliary = options.predictionInjectCount >= 2;
+options.candidatePolicy = normaliseCandidatePolicy(options.candidatePolicy);
+if any(strcmp(options.mode,{'B1','B2'})) && ...
+        ~strcmp(options.candidatePolicy,'direct_plus_auxiliary')
+    error('BLCMAES:PredictionInjectionOption', ...
+        'Legacy mode %s requires candidatePolicy=''direct_plus_auxiliary''.', ...
+        options.mode);
+end
+options.usesDirectPrediction = options.enabled && ...
+    strcmp(options.candidatePolicy,'direct_plus_auxiliary');
+options.usesAuxiliary = options.enabled && ...
+    (strcmp(options.candidatePolicy,'auxiliary_only') || ...
+     options.predictionInjectCount >= 2);
 validateattributes(options.logEnabled,{'logical','numeric'},{'scalar','binary'});
 options.logEnabled = logical(options.logEnabled) || options.enabled;
 for name = {'startGeneration','historyGenerations','sampleCount'}
@@ -95,6 +111,22 @@ if options.usesPrediction || options.logEnabled
             ['Prediction injection currently supports only SMD1--SMD12 ' ...
              'with two upper variables.']);
     end
+end
+end
+
+function policy = normaliseCandidatePolicy(policy)
+if isstring(policy), policy = char(policy); end
+validateattributes(policy,{'char'},{'row'});
+policy = lower(strtrim(policy));
+switch policy
+    case {'direct_plus_auxiliary','direct_plus_aux','direct'}
+        policy = 'direct_plus_auxiliary';
+    case {'auxiliary_only','aux_only'}
+        policy = 'auxiliary_only';
+    otherwise
+        error('BLCMAES:PredictionInjectionOption', ...
+            ['candidatePolicy must be ''direct_plus_auxiliary'' or ' ...
+             '''auxiliary_only''.']);
 end
 end
 

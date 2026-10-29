@@ -13,6 +13,8 @@ results_prediction_ablation/
 results_prediction_ablation_tests/
 results_prediction_injection/
 results_prediction_injection_tests/
+results_prediction_injection_K/
+results_prediction_auxiliary_only_K/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/
