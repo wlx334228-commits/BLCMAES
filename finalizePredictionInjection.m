@@ -48,7 +48,8 @@ entry.external_refinement_is_new_best = ...
     extraRefinedElite.UF >= max(populationUF);
 
 if options.usesPrediction
-    rows = zeros(numel(POP),5);
+    historyColumns = BI.u_dim + 3;
+    rows = zeros(numel(POP),historyColumns);
     for i = 1:numel(POP)
         rows(i,:) = [generation,i,POP(i).UX,POP(i).UF];
     end
@@ -57,8 +58,10 @@ if options.usesPrediction
             extraRefinedElite.UX,extraRefinedElite.UF];
     end
     state.history = [state.history;rows];
-    state.history = state.history(state.history(:,1) >= ...
-        generation-options.historyGenerations+1,:);
+    if ~options.useAllHistory
+        state.history = state.history(state.history(:,1) >= ...
+            generation-options.historyGenerations+1,:);
+    end
     model = fitLocalUpperQuadratic(state.history, ...
         samplingMean(1:BI.u_dim),generation,options);
     state.pending = struct('valid',model.valid,'x_pred',model.x_pred, ...

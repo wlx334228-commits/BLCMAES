@@ -1,32 +1,61 @@
 function model = fitLocalUpperQuadratic(history,meanBefore,generation,options)
-%FITLOCALUPPERQUADRATIC Fit the nearest historical UF samples, without FEs.
-% history columns: generation, individual_index, xu1, xu2, UF.
-% The reference mean is the mean that generated the current population.
-% The current population has already been evaluated when this is called.
-model = struct('valid',false,'reason','warmup','selectedSamples',zeros(0,5), ...
-    'distances',zeros(0,1),'scale',NaN,'coefficients',NaN(6,1), ...
-    'H',NaN(2),'hessianEigenvalues',NaN(2,1),'hessianRcond',NaN, ...
-    'designCondition',NaN,'fitTrainRMSE',NaN,'fitTrainR2',NaN, ...
+%FITLOCALUPPERQUADRATIC Fit a complete local upper-level quadratic model.
+% The archive has rows [generation, individual_index, xu(1:DU), UF].  Only
+% already evaluated entries are used.  The quadratic contains the constant,
+% every linear term, every squared term, and every pairwise cross term.
+
+upperDim = numel(meanBefore);
+% The older mean/individual correction experiments share this fitting
+% helper.  Missing high-dimensional controls retain their historic values.
+if ~isfield(options,'useAllHistory'), options.useAllHistory = false; end
+if ~isfield(options,'maxPredictionNormalizedDistance')
+    options.maxPredictionNormalizedDistance = Inf;
+end
+coefficientCount = (upperDim + 1) * (upperDim + 2) / 2;
+historyColumns = upperDim + 3;
+quadraticPairs = completeQuadraticPairs(upperDim);
+model = struct('valid',false,'reason','warmup', ...
+    'upperDimension',upperDim,'coefficientCount',coefficientCount, ...
+    'quadraticPairs',quadraticPairs, ...
+    'selectedSamples',zeros(0,historyColumns),'distances',zeros(0,1), ...
+    'scale',NaN,'coefficients',NaN(coefficientCount,1), ...
+    'H',NaN(upperDim),'hessianEigenvalues',NaN(upperDim,1), ...
+    'hessianRcond',NaN,'designRank',NaN,'designCondition',NaN, ...
+    'fitTrainRMSE',NaN,'fitTrainR2',NaN, ...
     'fitLOOCVRMSE',NaN,'fitLOOCVR2',NaN, ...
-    'selectedSpreadEigenvalues',NaN(2,1),'selectedSpreadCondition',NaN, ...
-    'z_pred',NaN(1,2),'zPredNorm',NaN,'x_pred',NaN(1,2), ...
+    'selectedSpreadEigenvalues',NaN(upperDim,1), ...
+    'selectedSpreadCondition',NaN, ...
+    'z_pred',NaN(1,upperDim),'zPredNorm',NaN, ...
+    'x_pred',NaN(1,upperDim), ...
     'predictionToNearestSample',NaN, ...
     'predictionToNearestSampleNormalized',NaN, ...
     'predictionInHull',NaN);
+
 if generation < options.startGeneration
     return;
 end
-firstGeneration = max(1,generation-options.historyGenerations+1);
-history = history(history(:,1) >= firstGeneration & ...
-                  history(:,1) <= generation,:);
+if size(history,2) ~= historyColumns
+    model.reason = 'invalid_history_shape';
+    return;
+end
+if ~options.useAllHistory
+    firstGeneration = max(1,generation-options.historyGenerations+1);
+    history = history(history(:,1) >= firstGeneration & ...
+                      history(:,1) <= generation,:);
+else
+    history = history(history(:,1) <= generation,:);
+end
 history = history(all(isfinite(history),2),:);
 if size(history,1) < options.sampleCount
     model.reason = 'insufficient_samples';
     return;
 end
-offsets = bsxfun(@minus,history(:,3:4),meanBefore);
+
+upperColumns = 3:(upperDim+2);
+objectiveColumn = upperDim + 3;
+offsets = bsxfun(@minus,history(:,upperColumns),meanBefore);
 distances = sqrt(sum(offsets.^2,2));
-% Break equal-distance ties by archive order, never by UF.
+% Equal distances are resolved by archive order, never by UF quality.
 [~,order] = sortrows([distances,(1:numel(distances))'],[1 2]);
 selected = order(1:options.sampleCount);
 model.selectedSamples = history(selected,:);
@@ -37,6 +66,7 @@ if ~isfinite(model.scale) || ...
     model.reason = 'degenerate_scale';
     return;
 end
+
 z = offsets(selected,:) / model.scale;
 selectedSpread = cov(z,1);
 model.selectedSpreadEigenvalues = eig(selectedSpread);
@@ -44,31 +74,39 @@ if min(abs(model.selectedSpreadEigenvalues)) > 0
     model.selectedSpreadCondition = max(abs(model.selectedSpreadEigenvalues)) / ...
         min(abs(model.selectedSpreadEigenvalues));
 end
-design = [ones(size(z,1),1),z(:,1),z(:,2),z(:,1).^2, ...
-          z(:,1).*z(:,2),z(:,2).^2];
+
+design = buildCompleteQuadraticDesign(z,quadraticPairs);
+model.designRank = rank(design);
+if model.designRank < coefficientCount
+    model.reason = 'rank_deficient_design';
+    return;
+end
 singularValues = svd(design,0);
-model.designCondition = singularValues(1)/singularValues(end);
+model.designCondition = singularValues(1) / singularValues(end);
 if ~isfinite(model.designCondition) || ...
         model.designCondition > options.maxDesignCondition
     model.reason = 'ill_conditioned_design';
     return;
 end
-a = design \ history(selected,5);
-model.coefficients = a;
-if any(~isfinite(a))
+
+coefficients = design \ history(selected,objectiveColumn);
+model.coefficients = coefficients;
+if any(~isfinite(coefficients))
     model.reason = 'invalid_coefficients';
     return;
 end
-fitted = design * a;
-residual = history(selected,5) - fitted;
+fitted = design * coefficients;
+residual = history(selected,objectiveColumn) - fitted;
 sumSquaredResidual = sum(residual.^2);
-totalSumSquares = sum((history(selected,5) - mean(history(selected,5))).^2);
+totalSumSquares = sum((history(selected,objectiveColumn) - ...
+    mean(history(selected,objectiveColumn))).^2);
 model.fitTrainRMSE = sqrt(mean(residual.^2));
 if totalSumSquares > 0
     model.fitTrainR2 = 1 - sumSquaredResidual / totalSumSquares;
 end
-% Exact leave-one-out residuals for a full-rank least-squares model.  This
-% reuses evaluated historical UF values only; it makes no objective call.
+
+% This diagnostic reuses the same fitted matrix and evaluated values.  It
+% never evaluates an objective or executes a lower-level optimization.
 [Q,~] = qr(design,0);
 leverage = sum(Q.^2,2);
 leaveOneOutDenominator = 1 - leverage;
@@ -80,7 +118,8 @@ if all(isfinite(leaveOneOutDenominator)) && ...
         model.fitLOOCVR2 = 1 - sum(leaveOneOutResidual.^2) / totalSumSquares;
     end
 end
-H = [2*a(4),a(5);a(5),2*a(6)];
+
+H = completeQuadraticHessian(coefficients,upperDim,quadraticPairs);
 model.H = H;
 model.hessianEigenvalues = eig(H);
 model.hessianRcond = rcond(H);
@@ -89,33 +128,84 @@ if ~isfinite(model.hessianRcond) || ...
     model.reason = 'ill_conditioned_hessian';
     return;
 end
-% ulTestProblem returns -F_original, and BL-CMA-ES sorts UF descending.
-% Consequently this fit must have a strict MAXIMUM, not a minimum.
+% UF is -F_original and BL-CMA-ES ranks it in descending order.  Therefore
+% an acceptable stationary point is a strict quadratic maximum.
 [~,notNegativeDefinite] = chol(-H);
 if notNegativeDefinite
     model.reason = 'hessian_not_negative_definite';
     return;
 end
-model.z_pred = (-(H \ a(2:3)))';
+
+linearCoefficients = coefficients(2:(upperDim+1));
+model.z_pred = (-(H \ linearCoefficients))';
+model.zPredNorm = norm(model.z_pred);
+if ~isfinite(model.zPredNorm) || ...
+        model.zPredNorm > options.maxPredictionNormalizedDistance
+    model.reason = 'extrapolated_prediction';
+    return;
+end
 model.x_pred = meanBefore + model.scale * model.z_pred;
 if ~isreal(model.x_pred) || any(~isfinite(model.x_pred))
     model.reason = 'invalid_prediction';
     return;
 end
-model.zPredNorm = norm(model.z_pred);
-predictionOffsets = bsxfun(@minus,model.selectedSamples(:,3:4),model.x_pred);
+
+predictionOffsets = bsxfun(@minus, ...
+    model.selectedSamples(:,upperColumns),model.x_pred);
 model.predictionToNearestSample = min(sqrt(sum(predictionOffsets.^2,2)));
 model.predictionToNearestSampleNormalized = ...
     model.predictionToNearestSample / model.scale;
-try
-    hullIndices = convhull(model.selectedSamples(:,3),model.selectedSamples(:,4));
-    model.predictionInHull = double(inpolygon(model.x_pred(1),model.x_pred(2), ...
-        model.selectedSamples(hullIndices,3),model.selectedSamples(hullIndices,4)));
-catch
-    % A valid quadratic can still be fitted even if a hull diagnostic is
-    % unavailable.  Keep the diagnostic missing instead of changing search.
-    model.predictionInHull = NaN;
+if upperDim == 2
+    try
+        hullIndices = convhull(model.selectedSamples(:,upperColumns(1)), ...
+            model.selectedSamples(:,upperColumns(2)));
+        model.predictionInHull = double(inpolygon(model.x_pred(1), ...
+            model.x_pred(2),model.selectedSamples(hullIndices,upperColumns(1)), ...
+            model.selectedSamples(hullIndices,upperColumns(2))));
+    catch
+        % The hull is diagnostic only.  Its absence must not change search.
+        model.predictionInHull = NaN;
+    end
 end
 model.valid = true;
 model.reason = 'valid';
+end
+
+function design = buildCompleteQuadraticDesign(z,quadraticPairs)
+% For DU=2 this retains the historic monomial order:
+% 1, z1, z2, z1^2, z1*z2, z2^2.
+sampleCount = size(z,1);
+design = [ones(sampleCount,1),z];
+for pairIndex = 1:size(quadraticPairs,1)
+    i = quadraticPairs(pairIndex,1);
+    j = quadraticPairs(pairIndex,2);
+    design(:,end+1) = z(:,i) .* z(:,j); %#ok<AGROW>
+end
+end
+
+function H = completeQuadraticHessian(coefficients,upperDim,quadraticPairs)
+H = zeros(upperDim);
+quadraticOffset = upperDim + 1;
+for pairIndex = 1:size(quadraticPairs,1)
+    i = quadraticPairs(pairIndex,1);
+    j = quadraticPairs(pairIndex,2);
+    value = coefficients(quadraticOffset + pairIndex);
+    if i == j
+        H(i,i) = 2 * value;
+    else
+        H(i,j) = value;
+        H(j,i) = value;
+    end
+end
+end
+
+function pairs = completeQuadraticPairs(upperDim)
+pairs = zeros(upperDim*(upperDim+1)/2,2);
+index = 0;
+for i = 1:upperDim
+    for j = i:upperDim
+        index = index + 1;
+        pairs(index,:) = [i,j];
+    end
+end
 end
