@@ -10,6 +10,7 @@ function options = predictionInjectionOptions(BI)
 
 options = struct('mode','A0','predictionInjectCount',NaN, ...
     'candidatePolicy','direct_plus_auxiliary', ...
+    'auxiliarySamplingDistribution','cma_gaussian', ...
     'enabled',false,'logEnabled',false, ...
     'startGeneration',10,'historyGenerations',10,'useAllHistory',false, ...
     'sampleCount',40, ...
@@ -64,6 +65,8 @@ end
 options.enabled = options.predictionInjectCount > 0;
 options.usesPrediction = options.enabled;
 options.candidatePolicy = normaliseCandidatePolicy(options.candidatePolicy);
+options.auxiliarySamplingDistribution = ...
+    normaliseAuxiliarySamplingDistribution(options.auxiliarySamplingDistribution);
 if any(strcmp(options.mode,{'B1','B2'})) && ...
         ~strcmp(options.candidatePolicy,'direct_plus_auxiliary')
     error('BLCMAES:PredictionInjectionOption', ...
@@ -127,6 +130,27 @@ if options.usesPrediction || options.logEnabled
             ['Prediction injection supports SMD1--SMD12 only at (2+3), ' ...
              '(5+5), or (10+10).']);
     end
+end
+end
+
+function distribution = normaliseAuxiliarySamplingDistribution(distribution)
+% Keep the original full-CMA Gaussian as the default.  The other two
+% choices alter only the upper marginal around x_pred; lower coordinates
+% retain the original conditional CMA-ES relationship in applyPredictionInjection.
+if isstring(distribution), distribution = char(distribution); end
+validateattributes(distribution,{'char'},{'row'});
+distribution = lower(strtrim(distribution));
+switch distribution
+    case {'cma_gaussian','cma','gaussian'}
+        distribution = 'cma_gaussian';
+    case {'isotropic_gaussian','isotropic','isotropic_normal'}
+        distribution = 'isotropic_gaussian';
+    case {'uniform_ellipsoid','ellipsoid','uniform'}
+        distribution = 'uniform_ellipsoid';
+    otherwise
+        error('BLCMAES:PredictionInjectionOption', ...
+            ['auxiliarySamplingDistribution must be ''cma_gaussian'', ' ...
+             '''isotropic_gaussian'', or ''uniform_ellipsoid''.']);
 end
 end
 

@@ -16,6 +16,9 @@ results_prediction_injection_tests/
 results_prediction_injection_K/
 results_prediction_auxiliary_only_K/
 results_prediction_injection_highdim*/
+results_prediction_injection_sensitivity_10D/
+results_auxiliary_sampling_ablation_2D/
+results_auxiliary_sampling_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/

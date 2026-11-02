@@ -68,6 +68,43 @@ entry.prediction_center_actual_step = xPredActual - ...
     entry.cma_mean_before_sampling(1:BI.u_dim);
 entry.injection_reason = 'prediction_injected';
 
+% Draw all auxiliary members before changing any population slot.  If the
+% requested covariance decomposition is numerically unusable, this entire
+% generation deliberately falls back to the already-drawn normal population
+% instead of evaluating a partially injected population.
+auxiliaryRaw = NaN(0,BI.dim);
+auxiliaryActual = NaN(0,BI.dim);
+auxiliaryRepair = false(0,BI.dim);
+samplingInfo = struct();
+if ~isempty(auxiliaryIndices)
+    if isempty(state.auxiliaryStream)
+        error('BLCMAES:AuxiliaryRandomStream', ...
+            'This policy requires its private auxiliary sampling stream.');
+    end
+    auxiliaryMean = CMA.xmean;
+    % Use the bounded prediction only as the auxiliary upper centre. The
+    % lower centre remains the main CMA-ES lower mean. In auxiliary-only
+    % mode this is the sole use of xPredActual: no population member is set
+    % equal to it directly.
+    auxiliaryMean(1:BI.u_dim) = xPredActual;
+    try
+        [auxiliaryRaw,samplingInfo] = sampleAuxiliaryJointCandidates( ...
+            CMA,auxiliaryMean,numel(auxiliaryIndices),BI,options, ...
+            state.auxiliaryStream);
+    catch samplingException
+        if strncmp(samplingException.identifier,'BLCMAES:Auxiliary', ...
+                numel('BLCMAES:Auxiliary'))
+            entry.prediction_valid_used = false;
+            entry.injection_reason = 'auxiliary_sampling_failed';
+            entry.upper_after_injection = upper;
+            entry.lower_after_injection = lower;
+            entry.joint_after_injection = [upper,lower];
+            return;
+        end
+        rethrow(samplingException);
+    end
+end
+
 if options.usesDirectPrediction
     upper(directIndex,:) = xPredActual;
     entry.source_labels{directIndex} = 'predicted_direct';
@@ -80,24 +117,10 @@ else
     % remain interpretable when no direct candidate exists.
     entry.prediction_center_boundary_repaired = predictionCentreRepair;
 end
-
 if ~isempty(auxiliaryIndices)
-    if isempty(state.auxiliaryStream)
-        error('BLCMAES:AuxiliaryRandomStream', ...
-            'This policy requires its private auxiliary sampling stream.');
-    end
-    auxiliaryMean = CMA.xmean;
-    % Use the bounded prediction only as the auxiliary upper centre. The
-    % lower centre remains the main CMA-ES lower mean. In auxiliary-only
-    % mode this is the sole use of xPredActual: no population member is set
-    % equal to it directly.
-    auxiliaryMean(1:BI.u_dim) = xPredActual;
-    auxiliaryRaw = NaN(numel(auxiliaryIndices),BI.dim);
     auxiliaryActual = NaN(numel(auxiliaryIndices),BI.dim);
     auxiliaryRepair = false(numel(auxiliaryIndices),BI.dim);
     for j = 1:numel(auxiliaryIndices)
-        auxiliaryRaw(j,:) = auxiliaryMean + CMA.sigma * ...
-            randn(state.auxiliaryStream,1,BI.dim) .* CMA.D * CMA.B';
         [auxiliaryActual(j,:),auxiliaryRepair(j,:)] = repairJointCandidate( ...
             auxiliaryRaw(j,:),auxiliaryMean,BI);
         index = auxiliaryIndices(j);
@@ -111,6 +134,11 @@ if ~isempty(auxiliaryIndices)
     entry.auxiliary_raw_joint = auxiliaryRaw;
     entry.auxiliary_actual_joint = auxiliaryActual;
     entry.auxiliary_boundary_repaired = auxiliaryRepair;
+    entry.auxiliary_upper_center = samplingInfo.upperCenter;
+    entry.auxiliary_upper_target_covariance = samplingInfo.upperTargetCovariance;
+    entry.auxiliary_lower_conditional_covariance = ...
+        samplingInfo.lowerConditionalCovariance;
+    entry.auxiliary_isotropic_variance = samplingInfo.isotropicVariance;
 end
 
 entry.upper_after_injection = upper;
@@ -120,6 +148,100 @@ entry.injected_indices = find(~strcmp(entry.source_labels,'normal'))';
 entry.injected_count = numel(entry.injected_indices);
 entry.effective_injected_count = entry.injected_count;
 entry.normal_sample_count = populationSize-entry.injected_count;
+end
+
+function [jointSamples,info] = sampleAuxiliaryJointCandidates( ...
+    CMA,auxiliaryMean,sampleCount,BI,options,stream)
+% Construct the auxiliary joint population without touching the global RNG.
+% For the two alternative upper distributions, lower variables are sampled
+% from the original CMA-ES Gaussian conditional on the new upper location.
+% Thus the lower marginal/conditional search relationship is retained and
+% the ablation changes only the upper distribution around x_pred.
+
+upperDim = BI.u_dim;
+lowerDim = BI.l_dim;
+jointDim = BI.dim;
+C = (CMA.C + CMA.C') / 2;
+Cuu = C(1:upperDim,1:upperDim);
+Cul = C(1:upperDim,upperDim+1:end);
+Cll = C(upperDim+1:end,upperDim+1:end);
+if rcond(Cuu) <= eps
+    error('BLCMAES:AuxiliaryCovariance', ...
+        'The upper CMA-ES covariance block is numerically singular.');
+end
+conditionalMap = Cuu \ Cul;
+conditionalLowerCovariance = CMA.sigma^2 * (Cll - Cul' * conditionalMap);
+conditionalLowerCovariance = ...
+    (conditionalLowerCovariance + conditionalLowerCovariance') / 2;
+upperTargetCovariance = CMA.sigma^2 * Cuu;
+upperCenter = auxiliaryMean(1:upperDim);
+lowerCenter = auxiliaryMean(upperDim+1:end);
+isotropicVariance = CMA.sigma^2 * trace(Cuu) / upperDim;
+jointSamples = NaN(sampleCount,jointDim);
+
+switch options.auxiliarySamplingDistribution
+    case 'cma_gaussian'
+        % Preserve the historic B2/K implementation exactly: one private
+        % row-vector normal draw per auxiliary member, transformed through
+        % the full joint CMA-ES eigensystem.
+        for j = 1:sampleCount
+            jointSamples(j,:) = auxiliaryMean + CMA.sigma * ...
+                randn(stream,1,jointDim) .* CMA.D * CMA.B';
+        end
+    case {'isotropic_gaussian','uniform_ellipsoid'}
+        upperFactor = symmetricSquareRoot(Cuu,'upper CMA-ES covariance');
+        lowerFactor = symmetricSquareRoot( ...
+            conditionalLowerCovariance,'conditional lower covariance');
+        for j = 1:sampleCount
+            normalDraw = randn(stream,1,jointDim);
+            switch options.auxiliarySamplingDistribution
+                case 'isotropic_gaussian'
+                    upper = upperCenter + sqrt(isotropicVariance) * ...
+                        normalDraw(1:upperDim);
+                case 'uniform_ellipsoid'
+                    directionNorm = norm(normalDraw(1:upperDim));
+                    if directionNorm <= 0
+                        % A zero normal vector has probability zero, but the
+                        % deterministic fallback keeps the routine total.
+                        direction = [1,zeros(1,upperDim-1)];
+                    else
+                        direction = normalDraw(1:upperDim) / directionNorm;
+                    end
+                    radius = rand(stream,1)^(1/upperDim);
+                    upper = upperCenter + sqrt(upperDim+2) * CMA.sigma * ...
+                        radius * direction * upperFactor';
+            end
+            upperOffset = upper - upperCenter;
+            lowerConditionalMean = lowerCenter + upperOffset * conditionalMap;
+            lower = lowerConditionalMean + normalDraw(upperDim+1:end) * ...
+                lowerFactor';
+            jointSamples(j,:) = [upper,lower];
+        end
+        if strcmp(options.auxiliarySamplingDistribution,'isotropic_gaussian')
+            upperTargetCovariance = isotropicVariance * eye(upperDim);
+        end
+    otherwise
+        error('BLCMAES:AuxiliaryDistribution', ...
+            'Unsupported auxiliary sampling distribution: %s', ...
+            options.auxiliarySamplingDistribution);
+end
+
+info = struct('upperCenter',upperCenter, ...
+    'upperTargetCovariance',upperTargetCovariance, ...
+    'lowerConditionalCovariance',conditionalLowerCovariance, ...
+    'isotropicVariance',isotropicVariance);
+end
+
+function factor = symmetricSquareRoot(covariance,label)
+covariance = (covariance + covariance') / 2;
+[vectors,values] = eig(covariance);
+eigenvalues = real(diag(values));
+scale = max(1,max(abs(eigenvalues)));
+if any(~isfinite(eigenvalues)) || min(eigenvalues) < -1e-10 * scale
+    error('BLCMAES:AuxiliaryCovariance', ...
+        '%s is not positive semidefinite.',label);
+end
+factor = real(vectors * diag(sqrt(max(eigenvalues,0))));
 end
 
 function reason = injectionReason(options,generation,state)
@@ -166,6 +288,7 @@ upperDim = BI.u_dim;
 jointDim = BI.dim;
 entry = struct('generation',generation,'mode',options.mode, ...
     'candidate_policy',options.candidatePolicy, ...
+    'auxiliary_sampling_distribution',options.auxiliarySamplingDistribution, ...
     'prediction_inject_count',options.predictionInjectCount, ...
     'random_seed',options.randomSeed, ...
     'population_size',populationSize, ...
@@ -194,6 +317,10 @@ entry = struct('generation',generation,'mode',options.mode, ...
     'auxiliary_raw_joint',NaN(0,jointDim), ...
     'auxiliary_actual_joint',NaN(0,jointDim), ...
     'auxiliary_boundary_repaired',false(0,jointDim), ...
+    'auxiliary_upper_center',NaN(1,upperDim), ...
+    'auxiliary_upper_target_covariance',NaN(upperDim), ...
+    'auxiliary_lower_conditional_covariance',NaN(BI.l_dim), ...
+    'auxiliary_isotropic_variance',NaN, ...
     'upper_before_injection',rawUpper,'lower_before_injection',rawLower, ...
     'joint_before_injection',[rawUpper,rawLower], ...
     'upper_after_injection',rawUpper,'lower_after_injection',rawLower, ...
