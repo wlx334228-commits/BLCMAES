@@ -21,6 +21,8 @@ results_auxiliary_sampling_ablation_2D/
 results_auxiliary_sampling_tests/
 results_auxiliary_sampling_scale_sensitivity_2D/
 results_auxiliary_sampling_scale_tests/
+results_hessian_auxiliary_sampling_2D/
+results_hessian_auxiliary_sampling_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/
