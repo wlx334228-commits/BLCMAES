@@ -9,7 +9,8 @@ pending = struct('valid',false,'x_pred',NaN(1,BI.u_dim), ...
 % deliberately dimension-dependent so the same injection code can retain
 % true evaluated upper samples for DU=2, DU=5, and DU=10.
 state = struct('history',zeros(0,BI.u_dim+3),'pending',pending, ...
-    'log',struct([]),'bestUF',-Inf,'auxiliaryStream',[]);
+    'log',struct([]),'bestUF',-Inf,'auxiliaryStream',[], ...
+    'modelStream',[]);
 if options.usesAuxiliary
     % A private stream preserves the original global random sequence used by
     % the main CMA-ES and every lower-level search.  In the original direct
@@ -17,5 +18,13 @@ if options.usesAuxiliary
     % K>=1 does.  All auxiliary candidates draw consecutively from it.
     state.auxiliaryStream = RandStream('mt19937ar', ...
         'Seed',options.auxiliaryRandomSeed);
+end
+if options.usesPrediction && strcmp(options.predictionModelType,'neural_mlp')
+    % Online MLP initialisation must not consume the global stream used by
+    % the original CMA-ES or lower-level optimisers.  This persistent
+    % private stream is used only to initialise each locally re-trained MLP;
+    % no training information is shared across independent runs.
+    state.modelStream = RandStream('mt19937ar', ...
+        'Seed',options.neuralRandomSeed);
 end
 end
