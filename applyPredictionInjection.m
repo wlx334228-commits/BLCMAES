@@ -105,6 +105,7 @@ auxiliaryRaw = NaN(0,BI.dim);
 auxiliaryActual = NaN(0,BI.dim);
 auxiliaryRepair = false(0,BI.dim);
 samplingInfo = struct();
+rlDecision = emptyPredictionRLDecision(BI.u_dim);
 if ~isempty(auxiliaryIndices)
     if isempty(state.auxiliaryStream)
         error('BLCMAES:AuxiliaryRandomStream', ...
@@ -116,10 +117,44 @@ if ~isempty(auxiliaryIndices)
     % mode this is the sole use of xPredActual: no population member is set
     % equal to it directly.
     auxiliaryMean(1:BI.u_dim) = xPredActual;
+    if options.rlEnabled
+        [state.rlState,rlDecision] = choosePredictionRLAction( ...
+            state.rlState,CMA,xPredActual,state.history,state.pending.model, ...
+            BI,options);
+        entry.rl_action_attempted = true;
+        entry.rl_action_valid = rlDecision.valid;
+        entry.rl_action_reason = rlDecision.reason;
+        entry.rl_mode = options.rlMode;
+        entry.rl_state_raw = rlDecision.state_raw;
+        entry.rl_state_normalized = rlDecision.state_normalized;
+        entry.rl_actor_mean = rlDecision.actor_mean;
+        entry.rl_actor_log_std = rlDecision.actor_log_std;
+        entry.rl_actor_std = rlDecision.actor_std;
+        entry.rl_action_latent = rlDecision.action_latent;
+        entry.rl_eta = rlDecision.eta;
+        entry.rl_delta = rlDecision.delta;
+        entry.rl_eta_learned = rlDecision.eta_learned;
+        entry.rl_delta_learned = rlDecision.delta_learned;
+        entry.rl_cma_eigenvalues = rlDecision.cmaEigenvalues;
+        entry.rl_eigenvalues = rlDecision.rlEigenvalues;
+        entry.rl_covariance = rlDecision.upperCovariance;
+        entry.rl_covariance_trace_ratio = rlDecision.trace_ratio;
+        entry.rl_covariance_condition = rlDecision.covariance_condition;
+        entry.rl_principal_directions = rlDecision.principalDirections;
+        if ~rlDecision.valid
+            % The already drawn normal population is the safe fallback.
+            entry.prediction_valid_used = false;
+            entry.injection_reason = 'rl_action_failed_normal_fallback';
+            entry.upper_after_injection = upper;
+            entry.lower_after_injection = lower;
+            entry.joint_after_injection = [upper,lower];
+            return;
+        end
+    end
     try
         [auxiliaryRaw,samplingInfo] = sampleAuxiliaryJointCandidates( ...
             CMA,auxiliaryMean,numel(auxiliaryIndices),BI,options, ...
-            state.auxiliaryStream,state.pending.model);
+            state.auxiliaryStream,state.pending.model,rlDecision);
     catch samplingException
         if strncmp(samplingException.identifier,'BLCMAES:Auxiliary', ...
                 numel('BLCMAES:Auxiliary')) || ...
@@ -135,6 +170,11 @@ if ~isempty(auxiliaryIndices)
                     samplingException.message;
                 entry.injection_reason = ...
                     'hessian_covariance_failed_normal_fallback';
+            elseif strcmp(options.auxiliarySamplingDistribution, ...
+                    'rl_adaptive_gaussian')
+                entry.rl_action_valid = false;
+                entry.rl_action_reason = samplingException.message;
+                entry.injection_reason = 'rl_covariance_failed_normal_fallback';
             else
                 entry.injection_reason = 'auxiliary_sampling_failed';
             end
@@ -223,6 +263,11 @@ if ~isempty(auxiliaryIndices)
     entry.auxiliary_relative_distance_to_cma_scale = ...
         entry.auxiliary_actual_distance_to_prediction / ...
         max(samplingInfo.cmaUpperRmsSearchScale,eps);
+    if options.rlEnabled
+        % This is the covariance that actually generated the two evaluated
+        % auxiliary points, after all positive-definiteness checks.
+        entry.rl_covariance = samplingInfo.upperTargetCovariance;
+    end
 end
 
 entry.upper_after_injection = upper;
@@ -235,14 +280,20 @@ entry.normal_sample_count = populationSize-entry.injected_count;
 end
 
 function [jointSamples,info] = sampleAuxiliaryJointCandidates( ...
-    CMA,auxiliaryMean,sampleCount,BI,options,stream,predictionModel)
+    CMA,auxiliaryMean,sampleCount,BI,options,stream,predictionModel,rlDecision)
 % Construct the auxiliary joint population without touching the global RNG.
 % For the alternative upper distributions, lower variables are sampled
 % from the original CMA-ES Gaussian conditional on the new upper location.
-% Thus the lower marginal/conditional search relationship is retained and
-% the ablation changes only the upper distribution around x_pred.
+% The RL branch deliberately retains the legacy direct-CMA lower draw so it
+% is paired fairly with the existing fixed-eta CMA-Gaussian baseline; in all
+% cases the changed object is only the upper distribution around x_pred.
 
 upperDim = BI.u_dim;
+% This helper has eight inputs.  Do not overwrite the valid RL action that
+% applyPredictionInjection has just selected for this generation.
+if nargin < 8 || isempty(rlDecision)
+    rlDecision = emptyPredictionRLDecision(upperDim);
+end
 lowerDim = BI.l_dim;
 jointDim = BI.dim;
 C = (CMA.C + CMA.C') / 2;
@@ -280,6 +331,25 @@ switch options.auxiliarySamplingDistribution
             % lower coordinates retain their existing sampled values.
             jointSamples(j,1:upperDim) = upperCenter + samplingScale * ...
                 (jointSamples(j,1:upperDim)-upperCenter);
+        end
+    case 'rl_adaptive_gaussian'
+        % Keep the legacy B2 lower-coordinate draw intact.  RL changes only
+        % the upper marginal around x_pred, so F050 and RL use the same
+        % private-stream joint normal draws and the same lower marginal.
+        if ~rlDecision.valid || any(~isfinite(rlDecision.upperCovariance(:)))
+            error('BLCMAES:AuxiliaryCovariance', ...
+                'No valid pre-sampling RL auxiliary covariance is available.');
+        end
+        upperTargetCovariance = (rlDecision.upperCovariance + ...
+            rlDecision.upperCovariance')/2;
+        rlFactor = symmetricSquareRoot(upperTargetCovariance, ...
+            'RL auxiliary covariance');
+        for j = 1:sampleCount
+            normalDraw = randn(stream,1,jointDim);
+            legacyJoint = auxiliaryMean + CMA.sigma * ...
+                normalDraw .* CMA.D * CMA.B';
+            upper = upperCenter + normalDraw(1:upperDim) * rlFactor';
+            jointSamples(j,:) = [upper,legacyJoint(upperDim+1:end)];
         end
     case {'isotropic_gaussian','uniform_ellipsoid','hessian_gaussian'}
         upperFactor = symmetricSquareRoot(Cuu,'upper CMA-ES covariance');
@@ -480,6 +550,7 @@ repaired = [upperHigh | upperLow,lowerHigh | lowerLow];
 end
 
 function entry = createEntry(CMA,rawUpper,rawLower,generation,BI,options)
+% One RL decision is shared by the two auxiliary candidates.
 populationSize = size(rawUpper,1);
 upperDim = BI.u_dim;
 jointDim = BI.dim;
@@ -558,6 +629,26 @@ entry = struct('generation',generation,'mode',options.mode, ...
     'auxiliary_raw_distance_to_prediction',NaN(0,1), ...
     'auxiliary_actual_distance_to_prediction',NaN(0,1), ...
     'auxiliary_relative_distance_to_cma_scale',NaN(0,1), ...
+    'rl_action_attempted',false,'rl_action_valid',false, ...
+    'rl_action_reason','not_requested','rl_mode','none', ...
+    'rl_state_raw',NaN(10,1),'rl_state_normalized',NaN(10,1), ...
+    'rl_actor_mean',NaN(2,1),'rl_actor_log_std',NaN(2,1), ...
+    'rl_actor_std',NaN(2,1),'rl_action_latent',NaN(2,1), ...
+    'rl_eta',NaN,'rl_delta',NaN,'rl_eta_learned',false, ...
+    'rl_delta_learned',false,'rl_cma_eigenvalues',NaN(upperDim,1), ...
+    'rl_eigenvalues',NaN(upperDim,1),'rl_covariance',NaN(upperDim), ...
+    'rl_covariance_trace_ratio',NaN,'rl_covariance_condition',NaN, ...
+    'rl_principal_directions',NaN(upperDim), ...
+    'rl_reward',NaN,'rl_reward_aux_vs_normal',NaN, ...
+    'rl_reward_aux_vs_direct',NaN,'rl_reward_history_improvement',NaN, ...
+    'rl_reward_baseline_before',NaN,'rl_reward_baseline_after',NaN, ...
+    'rl_advantage',NaN,'rl_auxiliary_UF',NaN(0,1), ...
+    'rl_auxiliary_direction_performance',NaN(1,upperDim), ...
+    'rl_actor_updated',false,'rl_update_reason','not_used', ...
+    'rl_gradient_norm_before_clip',NaN,'rl_gradient_norm_after_clip',NaN, ...
+    'rl_actor_step_before',NaN,'rl_actor_step_after',NaN, ...
+    'rl_actor_parameter_norm_before',NaN,'rl_actor_parameter_norm_after',NaN, ...
+    'rl_actor_parameters_before',struct(),'rl_actor_parameters_after',struct(), ...
     'upper_before_injection',rawUpper,'lower_before_injection',rawLower, ...
     'joint_before_injection',[rawUpper,rawLower], ...
     'upper_after_injection',rawUpper,'lower_after_injection',rawLower, ...

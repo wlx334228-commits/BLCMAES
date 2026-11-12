@@ -25,6 +25,8 @@ results_hessian_auxiliary_sampling_2D/
 results_hessian_auxiliary_sampling_tests/
 results_neural_prediction_comparison_2D/
 results_neural_prediction_tests/
+results_prediction_rl_adaptive_sampling_2D/
+results_prediction_rl_adaptive_sampling_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/

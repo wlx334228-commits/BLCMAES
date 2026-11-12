@@ -65,6 +65,36 @@ entry.external_refinement_is_new_best = ...
     entry.new_best_so_far && entry.external_refinement_upper_evaluated && ...
     extraRefinedElite.UF >= max(populationUF);
 
+if options.rlEnabled
+    % The two auxiliary candidates share exactly one pre-sampling action.
+    % Their single reward is formed only now, from their already completed
+    % true evaluations; no additional upper/lower evaluation is introduced.
+    [state.rlState,rlUpdate] = updatePredictionRLActor( ...
+        state.rlState,entry,previousBest,BI,options);
+    entry.rl_actor_updated = rlUpdate.updated;
+    entry.rl_update_reason = rlUpdate.reason;
+    entry.rl_reward = rlUpdate.reward;
+    entry.rl_reward_aux_vs_normal = rlUpdate.reward_aux_vs_normal;
+    entry.rl_reward_aux_vs_direct = rlUpdate.reward_aux_vs_direct;
+    entry.rl_reward_history_improvement = rlUpdate.reward_history_improvement;
+    entry.rl_reward_baseline_before = rlUpdate.reward_baseline_before;
+    entry.rl_reward_baseline_after = rlUpdate.reward_baseline_after;
+    entry.rl_advantage = rlUpdate.advantage;
+    entry.rl_auxiliary_UF = rlUpdate.auxiliary_UF;
+    entry.rl_auxiliary_direction_performance = ...
+        rlUpdate.auxiliary_direction_performance;
+    entry.rl_gradient_norm_before_clip = rlUpdate.gradient_norm_before_clip;
+    entry.rl_gradient_norm_after_clip = rlUpdate.gradient_norm_after_clip;
+    entry.rl_actor_step_before = rlUpdate.actor_step_before;
+    entry.rl_actor_step_after = rlUpdate.actor_step_after;
+    entry.rl_actor_parameter_norm_before = ...
+        rlUpdate.actor_parameter_norm_before;
+    entry.rl_actor_parameter_norm_after = ...
+        rlUpdate.actor_parameter_norm_after;
+    entry.rl_actor_parameters_before = rlUpdate.actor_parameters_before;
+    entry.rl_actor_parameters_after = rlUpdate.actor_parameters_after;
+end
+
 if options.usesPrediction
     historyColumns = BI.u_dim + 3;
     rows = zeros(numel(POP),historyColumns);
