@@ -97,6 +97,12 @@ for iter = 1 : maxIter
             injectionPredictionState] = applyPredictionInjection( ...
                 CMA,sampledUpper,sampledLower,iter,BI, ...
                 injectionPredictionOptions,injectionPredictionState);
+        % Pure snapshot metadata for post-run diagnostics.  These are the
+        % counters at the exact state that generated this population.  They
+        % are recorded only; neither counter, the CMA state, nor the random
+        % sequence is changed here.
+        injectionPredictionEntry.UFE_before_sampling = ulFunctionEvaluations;
+        injectionPredictionEntry.LFE_before_sampling = llFunctionEvaluations;
     end
     for i = 1 : CMA.lambda
         POP(i).UX = sampledUpper(i,:);
