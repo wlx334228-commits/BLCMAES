@@ -10,12 +10,24 @@
 
 % 2017/11/15 modify some termination criteria
 
-function ins = BLCMAES(BI)
+function ins = BLCMAES(BI,varargin)
+% The optional execution control is used exclusively by the continuous
+% auxiliary-scale diagnostic.  With the historic one-input call it is
+% disabled, so the original initialization, random calls, and search path
+% are unchanged.
+executionControl = parseExecutionControl(BI,varargin{:});
 % Prediction variants are intentionally mutually exclusive.  The injection
 % variant evaluates external candidates but never directly changes CMA.xmean.
 meanPredictionOptions = predictionCorrectionOptions(BI);
 individualPredictionOptions = individualPredictionCorrectionOptions(BI);
 injectionPredictionOptions = predictionInjectionOptions(BI);
+if executionControl.isBranch
+    % A branch changes only the scale used for its two auxiliary members.
+    % The normal distribution, direct prediction, lower search, and all
+    % CMA-ES update equations remain the ordinary F050 implementation.
+    injectionPredictionOptions.auxiliarySamplingScale = ...
+        executionControl.fixedAuxiliaryScale;
+end
 enabledPredictionStrategies = [meanPredictionOptions.enabled, ...
     individualPredictionOptions.enabled,injectionPredictionOptions.enabled];
 if sum(enabledPredictionStrategies) > 1
@@ -33,12 +45,25 @@ individualPredictionState = [];
 injectionPredictionState = [];
 global ulFunctionEvaluations;
 global llFunctionEvaluations;
-ulFunctionEvaluations = 0;
-llFunctionEvaluations = 0;
-
-elite = [];
-record = [];
-CMA = initCMAES(BI);
+if executionControl.isBranch
+    [CMA,elite,record,injectionPredictionState] = ...
+        restoreBranchRuntimeState(executionControl.resumeState,BI);
+    ulFunctionEvaluations = executionControl.resumeState.UFE_before_sampling;
+    llFunctionEvaluations = executionControl.resumeState.LFE_before_sampling;
+    % The branch consumes its own deterministic streams.  The caller saves
+    % and restores the surrounding main-run RNG after every branch.
+    rng(executionControl.resumeState.global_rng_after_normal_sampling);
+else
+    ulFunctionEvaluations = 0;
+    llFunctionEvaluations = 0;
+    elite = [];
+    record = [];
+    CMA = initCMAES(BI);
+end
+% POP is retained only so a main-run snapshot can include the immediately
+% preceding evaluated population.  It is never consulted by the optimizer.
+POP = [];
+continuousScaleSnapshots = struct([]);
 % Optional mean-trajectory logging. This is read-only bookkeeping and is
 % disabled unless BI.meanTrajectoryDiagnostic.enabled is explicitly true.
 meanTrajectoryDiagnostic = initializeMeanTrajectoryDiagnostic(BI);
@@ -55,7 +80,12 @@ if generationDiagnostic.enabled
 end
 maxIter = ceil(BI.UmaxFEs/CMA.lambda);
 ImprIter = ceil(BI.UmaxImprFEs/CMA.lambda);
-for iter = 1 : maxIter
+firstIteration = 1;
+if executionControl.isBranch
+    firstIteration = executionControl.resumeState.next_generation;
+    maxIter = min(maxIter,firstIteration + executionControl.horizonGenerations - 1);
+end
+for iter = firstIteration : maxIter
     if meanPredictionOptions.logEnabled
         % The centre that generates population iter; never a future mean.
         predictionMeanBefore = CMA.xmean(1:BI.u_dim);
@@ -76,21 +106,59 @@ for iter = 1 : maxIter
     % Normal joint-variable sampling.  Draw order and the original first
     % boundary repair are unchanged.  V2 touches only upper coordinates after
     % all lambda samples exist and before any true evaluation occurs.
-    sampledUpper = zeros(CMA.lambda,BI.u_dim);
-    sampledLower = zeros(CMA.lambda,BI.l_dim);
-    for i = 1 : CMA.lambda
-        U = CMA.xmean + CMA.sigma * randn(1,BI.dim) .* CMA.D * CMA.B';
-        flag = U > BI.xrange(2,:);
-        U(flag) = (CMA.xmean(flag) + BI.xrange(2,flag))/2;
-        flag = U < BI.xrange(1,:);
-        U(flag) = (CMA.xmean(flag) + BI.xrange(1,flag))/2;
-        sampledUpper(i,:) = U(1:BI.u_dim);
-        sampledLower(i,:) = U(BI.u_dim+1:end);
+    if executionControl.isBranch && ...
+            iter == executionControl.resumeState.next_generation
+        % The first branch generation reuses the exact normal population
+        % sampled in the main run before its scale-dependent auxiliaries
+        % were generated.  Thus eta is the only first-generation change.
+        sampledUpper = executionControl.resumeState.raw_normal_upper;
+        sampledLower = executionControl.resumeState.raw_normal_lower;
+    else
+        sampledUpper = zeros(CMA.lambda,BI.u_dim);
+        sampledLower = zeros(CMA.lambda,BI.l_dim);
+        normalStream = [];
+        if executionControl.isBranch
+            normalStream = RandStream('mt19937ar','Seed', ...
+                branchSeed(executionControl.branchRandomSeed,iter,11,0));
+        end
+        for i = 1 : CMA.lambda
+            if isempty(normalStream)
+                normalDraw = randn(1,BI.dim);
+            else
+                normalDraw = randn(normalStream,1,BI.dim);
+            end
+            U = CMA.xmean + CMA.sigma * normalDraw .* CMA.D * CMA.B';
+            flag = U > BI.xrange(2,:);
+            U(flag) = (CMA.xmean(flag) + BI.xrange(2,flag))/2;
+            flag = U < BI.xrange(1,:);
+            U(flag) = (CMA.xmean(flag) + BI.xrange(1,flag))/2;
+            sampledUpper(i,:) = U(1:BI.u_dim);
+            sampledLower(i,:) = U(BI.u_dim+1:end);
+        end
     end
     if individualPredictionOptions.logEnabled
         [sampledUpper,individualPredictionEntry,individualPredictionState] = ...
             applyIndividualPredictionCorrection(CMA,sampledUpper,sampledLower, ...
                 iter,BI,individualPredictionOptions,individualPredictionState);
+    end
+    if executionControl.captureSnapshots && ...
+            injectionPredictionOptions.logEnabled && ~executionControl.isBranch
+        % This is intentionally positioned after normal sampling and before
+        % prediction injection.  It only copies state; no evaluation or
+        % random-number call is introduced into the main run.
+        [snapshot,snapshotValid] = captureContinuousScaleSnapshot( ...
+            CMA,sampledUpper,sampledLower,iter,BI,injectionPredictionState, ...
+            elite,record,POP,ulFunctionEvaluations,llFunctionEvaluations,rng);
+        if snapshotValid
+            % struct([]) has no field schema in MATLAB.  Seed the archive
+            % with the first complete snapshot, then append only snapshots
+            % with this identical immutable state schema.
+            if isempty(continuousScaleSnapshots)
+                continuousScaleSnapshots = snapshot;
+            else
+                continuousScaleSnapshots(end+1,1) = snapshot; %#ok<AGROW>
+            end
+        end
     end
     if injectionPredictionOptions.logEnabled
         [sampledUpper,sampledLower,injectionPredictionEntry, ...
@@ -118,9 +186,28 @@ for iter = 1 : maxIter
         injectionPredictionEntry = recordPredictionInjectionEvaluationInput( ...
             injectionPredictionEntry,POP,injectionPredictionOptions);
     end
+    % Candidate-specific lower-search streams are keyed by role in a
+    % diagnostic branch.  Thus a direct prediction keeps the same lower
+    % random sequence in K3 and A1 even though it occupies slot 6 in K3 and
+    % slot 8 in A1.  The historic main path still receives empty seeds.
+    lowerCandidateKeys = 1:CMA.lambda;
+    if executionControl.isBranch && injectionPredictionOptions.logEnabled
+        auxiliaryCounter = 0;
+        for candidateIndex = 1:CMA.lambda
+            source = injectionPredictionEntry.source_labels{candidateIndex};
+            if strcmp(source,'predicted_direct')
+                lowerCandidateKeys(candidateIndex) = 101;
+            elseif strcmp(source,'predicted_auxiliary')
+                auxiliaryCounter = auxiliaryCounter + 1;
+                lowerCandidateKeys(candidateIndex) = 200 + auxiliaryCounter;
+            end
+        end
+    end
     % lower level search
     for i = 1 : CMA.lambda
-        [POP(i).LX,POP(i).LF,POP(i).LC,POP(i).RF] = lowerLevelSearch(POP(i).UX,CMA,BI);
+        [POP(i).LX,POP(i).LF,POP(i).LC,POP(i).RF] = lowerLevelSearch( ...
+            POP(i).UX,CMA,BI,branchLowerSeedForCandidate( ...
+            executionControl,iter,lowerCandidateKeys(i)));
         [POP(i).UF,POP(i).UC] = UL_evaluate(POP(i).UX,POP(i).LX,BI.fn);
         POP(i).UFEs = ulFunctionEvaluations;
         POP(i).LFEs = llFunctionEvaluations;
@@ -151,14 +238,26 @@ for iter = 1 : maxIter
     % It is archived for diagnostics/prediction, but never inserted into this
     % generation's CMA-ES parent pool.
     extraRefinedElite = [];
-    if upperLevelComparator(bestIndv,elite,BI) || rand > 0.5
-        [bestIndv,~] = refine(bestIndv,CMA,BI);
+    if executionControl.isBranch
+        decisionStream = RandStream('mt19937ar','Seed', ...
+            branchSeed(executionControl.branchRandomSeed,iter,17,0));
+        eliteCoin = rand(decisionStream);
+        refineBest = upperLevelComparator(bestIndv,elite,BI) || eliteCoin > 0.5;
+    else
+        % Keep the original short-circuit random call order exactly for the
+        % normal optimizer path.
+        refineBest = upperLevelComparator(bestIndv,elite,BI) || rand > 0.5;
+    end
+    if refineBest
+        [bestIndv,~] = refine(bestIndv,CMA,BI, ...
+            branchLowerSeedForRefinement(executionControl,iter,1));
     	POP(bestIdx) = bestIndv;
     	if upperLevelComparator(bestIndv,elite,BI)
     		elite = bestIndv;
     	end
     else
-        [elite,refinedOldElite] = refine(elite,CMA,BI);
+        [elite,refinedOldElite] = refine(elite,CMA,BI, ...
+            branchLowerSeedForRefinement(executionControl,iter,2));
         if refinedOldElite
             extraRefinedElite = elite;
         end
@@ -206,10 +305,22 @@ for iter = 1 : maxIter
     reachTheFlat = iter>ImprIter && abs(record(iter).UF-record(iter-ImprIter+1).UF)/(abs(record(1).UF)+abs(record(iter).UF)) < BI.u_ftol; 
     reachTheFlat = reachTheFlat && abs(record(iter).UF-record(iter-ImprIter+1).UF) < BI.u_ftol;
     
-    if reachTheTarget_b || reachTheTarget_e || reachTheMaxFEs || reachTheFlat
-        if reachTheTarget_b
-            elite = bestIndv;
-        end
+    standardTermination = reachTheTarget_b || reachTheTarget_e || ...
+        reachTheMaxFEs || reachTheFlat;
+    % A continuation branch is a fixed-horizon diagnostic, not a new
+    % stopping rule for ordinary BL-CMA-ES.  Once a branch has reached an
+    % accuracy/flatness condition it still takes the remaining requested
+    % generations so every eta receives the same H-generation opportunity.
+    % The hard UFE limit remains a safety stop in all modes.
+    forceBranchContinuation = standardTermination && ...
+        executionControl.isBranch && executionControl.forceFixedHorizon && ...
+        ~reachTheMaxFEs;
+    if reachTheTarget_b
+        % Preserve the original elite replacement before either stopping or
+        % continuing from a target-reaching evaluated population.
+        elite = bestIndv;
+    end
+    if standardTermination && ~forceBranchContinuation
         % The original code does not execute updateCMAES on a terminating
         % generation.  Log its real, pre-update mean and mark that fact.
         if generationDiagnostic.enabled
@@ -265,7 +376,13 @@ for iter = 1 : maxIter
             updateInfo,individualPredictionOptions);
     end
     if injectionPredictionOptions.logEnabled
-        injectionPredictionEntry.termination_reason = 'continue';
+        if forceBranchContinuation
+            injectionPredictionEntry.termination_reason = ...
+                ['forced_horizon_continue_' getTerminationReason( ...
+                reachTheTarget_b,reachTheTarget_e,reachTheMaxFEs,reachTheFlat)];
+        else
+            injectionPredictionEntry.termination_reason = 'continue';
+        end
         injectionPredictionState = appendPredictionInjectionLog( ...
             injectionPredictionState,injectionPredictionEntry,CMA,true, ...
             updateInfo,injectionPredictionOptions);
@@ -302,6 +419,21 @@ end
 if injectionPredictionOptions.logEnabled
     ins.predictionInjectionLog = injectionPredictionState.log;
     ins.predictionInjectionOptions = injectionPredictionOptions;
+end
+if executionControl.captureSnapshots && ~executionControl.isBranch
+    ins.continuousScaleSnapshots = continuousScaleSnapshots;
+end
+if executionControl.isBranch
+    ins.continuousScaleBranch = struct( ...
+        'startGeneration',executionControl.resumeState.next_generation, ...
+        'requestedGenerations',executionControl.horizonGenerations, ...
+        'lastGeneration',executionControl.resumeState.next_generation + ...
+            numel(injectionPredictionState.log) - 1, ...
+        'fixedAuxiliaryScale',executionControl.fixedAuxiliaryScale, ...
+        'branchRandomSeed',executionControl.branchRandomSeed, ...
+        'UFEStart',executionControl.resumeState.UFE_before_sampling, ...
+        'LFEStart',executionControl.resumeState.LFE_before_sampling, ...
+        'UFEEnd',ulFunctionEvaluations,'LFEEnd',llFunctionEvaluations);
 end
 if meanTrajectoryDiagnostic.enabled
     ins.meanTrajectory = meanTrajectoryDiagnostic.rows;
@@ -351,10 +483,11 @@ for i = 1 : length(POP)
 	% according to latest experimental results, incorporating RF here seems to be meaningless
 end
 
-function [Q,upperEvaluated] = refine(P,CMA,BI)
+function [Q,upperEvaluated] = refine(P,CMA,BI,branchLowerSeed)
+if nargin < 4, branchLowerSeed = []; end
 Q = P;
 upperEvaluated = false;
-[Q.LX,Q.LF,Q.LC,Q.RF] = lowerLevelSearch(Q.UX,CMA,BI);
+[Q.LX,Q.LF,Q.LC,Q.RF] = lowerLevelSearch(Q.UX,CMA,BI,branchLowerSeed);
 if lowerLevelComparator(Q,P)
     Q.RF = max(Q.RF,P.RF);
     [Q.UF,Q.UC] = UL_evaluate(Q.UX,Q.LX,BI.fn);
@@ -379,7 +512,16 @@ else
     isNoWorseThan = tmp(1).fit >= tmp(2).fit;
 end
 
-function [bestLX,bestLF,bestLC,bestRF] = lowerLevelSearch(xu,CMA,BI)
+function [bestLX,bestLF,bestLC,bestRF] = lowerLevelSearch(xu,CMA,BI,branchRandomSeed)
+% Branch diagnostics use a temporary, candidate-specific stream.  This
+% keeps lower-search random draws paired across eta branches and, because
+% the original global stream is restored on return, cannot perturb normal
+% CMA-ES sampling.  Historic calls omit the fourth input entirely.
+if nargin >= 4 && ~isempty(branchRandomSeed)
+    savedLowerRng = rng;
+    rng(branchRandomSeed,'twister');
+    lowerRngCleanup = onCleanup(@() rng(savedLowerRng)); %#ok<NASGU>
+end
 sigma0 = 1;
 LCMA.xmean = CMA.xmean(BI.u_dim+1:end);
 LCMA.sigma = sigma0;
@@ -789,3 +931,109 @@ diagnostic.covariances{end+1,1} = CMA.C;
 diagnostic.updateEliteIndices{end+1,1} = updateEliteIndices;
 diagnostic.updateEliteWeights{end+1,1} = updateEliteWeights;
 diagnostic.generationBestIndices(end+1,1) = generationBestIndex;
+
+function control = parseExecutionControl(BI,varargin)
+%PARSEEXECUTIONCONTROL Keep all legacy BLCMAES(BI) calls byte-for-byte
+% equivalent in behaviour.  The branch form is intentionally restricted to
+% the (2+3) F050 quadratic experiment used by the diagnostic runner.
+control = struct('isBranch',false,'captureSnapshots',false, ...
+    'resumeState',struct(),'fixedAuxiliaryScale',NaN, ...
+    'horizonGenerations',NaN,'branchRandomSeed',NaN, ...
+    'forceFixedHorizon',false);
+if isempty(varargin), return; end
+assert(numel(varargin) == 1 && isstruct(varargin{1}) && isscalar(varargin{1}), ...
+    'BLCMAES:ExecutionControl','Execution control must be one scalar struct.');
+requested = varargin{1};
+if isfield(requested,'captureSnapshots')
+    validateattributes(requested.captureSnapshots,{'logical','numeric'}, ...
+        {'scalar','binary'});
+    control.captureSnapshots = logical(requested.captureSnapshots);
+end
+if ~isfield(requested,'mode') || isempty(requested.mode)
+    return;
+end
+mode = lower(char(requested.mode));
+assert(ismember(mode,{'main','branch'}), ...
+    'BLCMAES:ExecutionControl','mode must be main or branch.');
+if strcmp(mode,'main'), return; end
+control.isBranch = true;
+required = {'resumeState','fixedAuxiliaryScale','horizonGenerations', ...
+    'branchRandomSeed'};
+for index = 1:numel(required)
+    assert(isfield(requested,required{index}), ...
+        'BLCMAES:ExecutionControl','Branch execution misses %s.',required{index});
+end
+control.resumeState = requested.resumeState;
+control.fixedAuxiliaryScale = requested.fixedAuxiliaryScale;
+control.horizonGenerations = requested.horizonGenerations;
+control.branchRandomSeed = requested.branchRandomSeed;
+% Branches are created specifically for matched H-generation diagnostics.
+% Allow an explicit opt-out for future non-diagnostic callers, but make the
+% safe fixed-horizon interpretation the default for this private interface.
+control.forceFixedHorizon = true;
+if isfield(requested,'forceFixedHorizon')
+    validateattributes(requested.forceFixedHorizon,{'logical','numeric'}, ...
+        {'scalar','binary'});
+    control.forceFixedHorizon = logical(requested.forceFixedHorizon);
+end
+validateattributes(control.fixedAuxiliaryScale,{'numeric'}, ...
+    {'real','finite','scalar','positive'});
+validateattributes(control.horizonGenerations,{'numeric'}, ...
+    {'real','finite','scalar','integer','positive'});
+validateattributes(control.branchRandomSeed,{'numeric'}, ...
+    {'real','finite','scalar','integer','nonnegative'});
+requiredSnapshot = {'next_generation','CMA','elite','record', ...
+    'injection_state','UFE_before_sampling','LFE_before_sampling', ...
+    'raw_normal_upper','raw_normal_lower','global_rng_after_normal_sampling'};
+for index = 1:numel(requiredSnapshot)
+    assert(isfield(control.resumeState,requiredSnapshot{index}), ...
+        'BLCMAES:ExecutionControl','Resume snapshot misses %s.', ...
+        requiredSnapshot{index});
+end
+assert(BI.u_dim == 2 && BI.l_dim == 3, ...
+    'BLCMAES:ExecutionControl', ...
+    'Continuous scale branches currently support only DU=2, DL=3.');
+assert(size(control.resumeState.raw_normal_upper,1) == ...
+        control.resumeState.CMA.lambda && ...
+    isequal(size(control.resumeState.raw_normal_upper), ...
+        [control.resumeState.CMA.lambda BI.u_dim]) && ...
+    isequal(size(control.resumeState.raw_normal_lower), ...
+        [control.resumeState.CMA.lambda BI.l_dim]), ...
+    'BLCMAES:ExecutionControl', ...
+    'Resume snapshot normal population is incompatible with the CMA state.');
+
+function [CMA,elite,record,state] = restoreBranchRuntimeState(snapshot,BI)
+CMA = snapshot.CMA;
+assert(numel(CMA.xmean) == BI.dim && isequal(size(CMA.C),[BI.dim BI.dim]), ...
+    'BLCMAES:ExecutionControl','Resume CMA state has incompatible dimensions.');
+% Recompute derived eigensystem fields from the persisted covariance rather
+% than trusting stale serialised values.
+CMA.C = (CMA.C + CMA.C')/2;
+[CMA.B,Dmatrix] = eig(CMA.C);
+CMA.D = sqrt(max(real(diag(Dmatrix)),eps))';
+CMA.invsqrtC = CMA.B * diag(CMA.D.^-1) * CMA.B';
+elite = snapshot.elite;
+record = snapshot.record;
+state = restorePredictionInjectionStateForBranch(snapshot.injection_state);
+% Branch logs start empty so only post-snapshot generations are reported.
+state.log = struct([]);
+
+function seed = branchLowerSeedForCandidate(control,generation,candidateIndex)
+if ~control.isBranch
+    seed = [];
+else
+    seed = branchSeed(control.branchRandomSeed,generation,31,candidateIndex);
+end
+
+function seed = branchLowerSeedForRefinement(control,generation,kind)
+if ~control.isBranch
+    seed = [];
+else
+    seed = branchSeed(control.branchRandomSeed,generation,37,kind);
+end
+
+function seed = branchSeed(base,generation,streamKind,index)
+% Stay in the portable positive integer range accepted by rng/RandStream.
+seed = mod(double(base) + 104729*double(generation) + ...
+    1009*double(streamKind) + 7919*double(index),2^31-2) + 1;
+seed = floor(seed);

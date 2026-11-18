@@ -31,6 +31,8 @@ results_prediction_scale_stage_diagnostic_2D/
 results_prediction_scale_stage_diagnostic_tests/
 results_prediction_scale_all_events_2D/
 results_prediction_scale_all_events_tests/
+results_continuous_scale_branch_2D/
+results_continuous_scale_branch_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/
