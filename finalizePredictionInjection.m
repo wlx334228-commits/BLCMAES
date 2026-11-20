@@ -59,6 +59,7 @@ entry.external_refinement_upper_evaluated = ~isempty(extraRefinedElite);
 if ~isempty(extraRefinedElite)
     entry.external_refinement_joint = [extraRefinedElite.UX,extraRefinedElite.LX];
     entry.external_refinement_UF = extraRefinedElite.UF;
+    entry.external_refinement_UFE = UFE;
 end
 entry.new_best_so_far = state.bestUF > previousBest;
 entry.external_refinement_is_new_best = ...
