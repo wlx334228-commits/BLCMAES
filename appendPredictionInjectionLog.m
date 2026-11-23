@@ -14,6 +14,7 @@ if updateApplied
     entry.selected_parent_indices = updateInfo.eliteIndices;
     entry.selected_parent_joint = updateInfo.parentJoint;
     entry.selected_parent_sources = entry.source_labels(updateInfo.eliteIndices)';
+    entry.parent_recombination_weights = updateInfo.eliteWeights(:);
     entry.direct_parent_selected = any(strcmp(entry.selected_parent_sources, ...
         'predicted_direct'));
     entry.auxiliary_parent_selected = any(strcmp(entry.selected_parent_sources, ...

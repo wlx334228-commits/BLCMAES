@@ -35,6 +35,8 @@ results_continuous_scale_branch_2D/
 results_continuous_scale_branch_tests/
 results_scale_outcome_model_2D/
 results_scale_outcome_model_tests/
+results_nextgen_scale_2D/
+results_nextgen_scale_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/

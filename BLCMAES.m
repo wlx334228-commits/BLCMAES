@@ -64,6 +64,10 @@ end
 % preceding evaluated population.  It is never consulted by the optimizer.
 POP = [];
 continuousScaleSnapshots = struct([]);
+% A branch-only, read-only diagnostic of the distribution obtained after
+% the intervention generation.  It is deliberately empty for ordinary
+% BL-CMA-ES calls and is never used by the optimizer itself.
+normalProbe = emptyNextGenerationNormalProbe(BI);
 % Optional mean-trajectory logging. This is read-only bookkeeping and is
 % disabled unless BI.meanTrajectoryDiagnostic.enabled is explicitly true.
 meanTrajectoryDiagnostic = initializeMeanTrajectoryDiagnostic(BI);
@@ -86,7 +90,11 @@ if executionControl.isBranch
     maxIter = min(maxIter,firstIteration + executionControl.horizonGenerations - 1);
 end
 for iter = firstIteration : maxIter
-    if executionControl.isBranch && injectionPredictionOptions.enabled
+    isNextGenerationNormalProbe = executionControl.isBranch && ...
+        executionControl.normalProbeAfterUpdate && ...
+        iter == firstIteration + 1;
+    if executionControl.isBranch && injectionPredictionOptions.enabled && ...
+            ~isNextGenerationNormalProbe
         % A diagnostic branch may intervene at its first resumed generation
         % and then revert to another prescribed auxiliary scale.  This is
         % deliberately applied immediately before injection, never to the
@@ -116,6 +124,10 @@ for iter = firstIteration : maxIter
     % Normal joint-variable sampling.  Draw order and the original first
     % boundary repair are unchanged.  V2 touches only upper coordinates after
     % all lambda samples exist and before any true evaluation occurs.
+    sampleCount = CMA.lambda;
+    if isNextGenerationNormalProbe
+        sampleCount = executionControl.normalProbeCount;
+    end
     if executionControl.isBranch && ...
             iter == executionControl.resumeState.next_generation
         % The first branch generation reuses the exact normal population
@@ -123,20 +135,23 @@ for iter = firstIteration : maxIter
         % were generated.  Thus eta is the only first-generation change.
         sampledUpper = executionControl.resumeState.raw_normal_upper;
         sampledLower = executionControl.resumeState.raw_normal_lower;
+        normalDraws = NaN(size(sampledUpper,1),BI.dim);
     else
-        sampledUpper = zeros(CMA.lambda,BI.u_dim);
-        sampledLower = zeros(CMA.lambda,BI.l_dim);
+        sampledUpper = zeros(sampleCount,BI.u_dim);
+        sampledLower = zeros(sampleCount,BI.l_dim);
+        normalDraws = zeros(sampleCount,BI.dim);
         normalStream = [];
         if executionControl.isBranch
             normalStream = RandStream('mt19937ar','Seed', ...
                 branchSeed(executionControl.branchRandomSeed,iter,11,0));
         end
-        for i = 1 : CMA.lambda
+        for i = 1 : sampleCount
             if isempty(normalStream)
                 normalDraw = randn(1,BI.dim);
             else
                 normalDraw = randn(normalStream,1,BI.dim);
             end
+            normalDraws(i,:) = normalDraw;
             U = CMA.xmean + CMA.sigma * normalDraw .* CMA.D * CMA.B';
             flag = U > BI.xrange(2,:);
             U(flag) = (CMA.xmean(flag) + BI.xrange(2,flag))/2;
@@ -145,6 +160,15 @@ for iter = firstIteration : maxIter
             sampledUpper(i,:) = U(1:BI.u_dim);
             sampledLower(i,:) = U(BI.u_dim+1:end);
         end
+    end
+    if isNextGenerationNormalProbe
+        % This deliberately stops before injection, ranking, refinement,
+        % history/archive updates and CMA-ES update.  The resulting true
+        % evaluations therefore measure only the *next normal sampling*
+        % quality of the distribution created by the preceding intervention.
+        normalProbe = evaluateNextGenerationNormalProbe( ...
+            sampledUpper,sampledLower,normalDraws,CMA,BI,executionControl,iter,elite);
+        break;
     end
     if individualPredictionOptions.logEnabled
         [sampledUpper,individualPredictionEntry,individualPredictionState] = ...
@@ -445,6 +469,7 @@ if injectionPredictionOptions.logEnabled
     ins.predictionInjectionLog = injectionPredictionState.log;
     ins.predictionInjectionOptions = injectionPredictionOptions;
 end
+ins.nextGenerationNormalProbe = normalProbe;
 if executionControl.captureSnapshots && ~executionControl.isBranch
     ins.continuousScaleSnapshots = continuousScaleSnapshots;
 end
@@ -456,6 +481,8 @@ if executionControl.isBranch
             numel(injectionPredictionState.log) - 1, ...
         'fixedAuxiliaryScale',executionControl.fixedAuxiliaryScale, ...
         'auxiliaryScaleSchedule',executionControl.auxiliaryScaleSchedule, ...
+        'normalProbeAfterUpdate',executionControl.normalProbeAfterUpdate, ...
+        'normalProbeCount',executionControl.normalProbeCount, ...
         'branchRandomSeed',executionControl.branchRandomSeed, ...
         'UFEStart',executionControl.resumeState.UFE_before_sampling, ...
         'LFEStart',executionControl.resumeState.LFE_before_sampling, ...
@@ -732,6 +759,69 @@ if Model.sigma > 1e7 * max(Model.D)
     Model.C = Model.C * fac^2;
 end
 
+function probe = evaluateNextGenerationNormalProbe( ...
+        sampledUpper,sampledLower,normalDraws,CMA,BI,control,generation,elite)
+%EVALUATENEXTGENERATIONNORMALPROBE True evaluation of normal-only samples.
+% This helper is available only to an explicitly requested diagnostic
+% branch. It does not create a parent population, refine an individual,
+% append prediction history, or mutate CMA. Its result consequently measures
+% only the quality of the distribution created by the preceding update.
+global ulFunctionEvaluations;
+global llFunctionEvaluations;
+
+count = size(sampledUpper,1);
+probe = emptyNextGenerationNormalProbe(BI);
+probe.attempted = true;
+probe.generation = generation;
+probe.requested_count = control.normalProbeCount;
+probe.candidate_count = count;
+probe.UFE_before = ulFunctionEvaluations;
+probe.LFE_before = llFunctionEvaluations;
+probe.cma_mean = CMA.xmean;
+probe.sigma = CMA.sigma;
+probe.C = CMA.C;
+if ~isempty(elite) && isfield(elite,'UF') && isfinite(elite.UF)
+    probe.elite_UF_before_probe = elite.UF;
+end
+
+probe.upper = sampledUpper;
+probe.lower_initial = sampledLower;
+probe.standard_normal_draws = normalDraws;
+for i = 1:count
+    [probe.lower_evaluated(i,:),probe.LF(i),probe.LC(i),probe.RF(i)] = ...
+        lowerLevelSearch(sampledUpper(i,:),CMA,BI, ...
+        branchLowerSeedForCandidate(control,generation,i));
+    [probe.UF(i),probe.UC(i)] = UL_evaluate( ...
+        sampledUpper(i,:),probe.lower_evaluated(i,:),BI.fn);
+    probe.upper_error(i) = abs(probe.UF(i)-BI.u_fopt);
+    probe.lower_error(i) = abs(probe.LF(i)-BI.l_fopt);
+    probe.candidate_UFE(i) = ulFunctionEvaluations;
+    probe.candidate_LFE(i) = llFunctionEvaluations;
+end
+if count > 0 && all(isfinite(probe.UF))
+    [sortedUF,order] = sort(probe.UF,'descend');
+    probe.best_index = order(1);
+    probe.best_UF = sortedUF(1);
+    probe.top_two_mean_UF = mean(sortedUF(1:min(2,count)));
+end
+probe.UFE_after = ulFunctionEvaluations;
+probe.LFE_after = llFunctionEvaluations;
+probe.completed = true;
+
+function probe = emptyNextGenerationNormalProbe(BI)
+% Fixed schema makes offline branch outputs safe to concatenate.
+probe = struct('attempted',false,'completed',false,'generation',NaN, ...
+    'requested_count',NaN,'candidate_count',0,'UFE_before',NaN, ...
+    'UFE_after',NaN,'LFE_before',NaN,'LFE_after',NaN, ...
+    'cma_mean',NaN(1,BI.dim),'sigma',NaN,'C',NaN(BI.dim), ...
+    'elite_UF_before_probe',NaN,'upper',NaN(0,BI.u_dim), ...
+    'lower_initial',NaN(0,BI.l_dim),'lower_evaluated',NaN(0,BI.l_dim), ...
+    'standard_normal_draws',NaN(0,BI.dim), ...
+    'UF',NaN(0,1),'LF',NaN(0,1),'UC',NaN(0,1),'LC',NaN(0,1), ...
+    'RF',false(0,1),'upper_error',NaN(0,1),'lower_error',NaN(0,1), ...
+    'candidate_UFE',NaN(0,1),'candidate_LFE',NaN(0,1), ...
+    'best_index',NaN,'best_UF',NaN,'top_two_mean_UF',NaN);
+
 function diagnostic = initializeMeanTrajectoryDiagnostic(BI)
 diagnostic.enabled = false;
 diagnostic.rows = zeros(0,3);
@@ -966,7 +1056,8 @@ control = struct('isBranch',false,'captureSnapshots',false, ...
     'resumeState',struct(),'fixedAuxiliaryScale',NaN, ...
     'auxiliaryScaleSchedule',NaN, ...
     'horizonGenerations',NaN,'branchRandomSeed',NaN, ...
-    'forceFixedHorizon',false);
+    'forceFixedHorizon',false,'normalProbeAfterUpdate',false, ...
+    'normalProbeCount',NaN);
 if isempty(varargin), return; end
 assert(numel(varargin) == 1 && isstruct(varargin{1}) && isscalar(varargin{1}), ...
     'BLCMAES:ExecutionControl','Execution control must be one scalar struct.');
@@ -1003,12 +1094,28 @@ if isfield(requested,'forceFixedHorizon')
         {'scalar','binary'});
     control.forceFixedHorizon = logical(requested.forceFixedHorizon);
 end
+if isfield(requested,'normalProbeAfterUpdate')
+    validateattributes(requested.normalProbeAfterUpdate,{'logical','numeric'}, ...
+        {'scalar','binary'});
+    control.normalProbeAfterUpdate = logical(requested.normalProbeAfterUpdate);
+end
+if isfield(requested,'normalProbeCount') && ~isempty(requested.normalProbeCount)
+    control.normalProbeCount = requested.normalProbeCount;
+end
 validateattributes(control.fixedAuxiliaryScale,{'numeric'}, ...
     {'real','finite','scalar','positive'});
 validateattributes(control.horizonGenerations,{'numeric'}, ...
     {'real','finite','scalar','integer','positive'});
 validateattributes(control.branchRandomSeed,{'numeric'}, ...
     {'real','finite','scalar','integer','nonnegative'});
+if control.normalProbeAfterUpdate
+    expectedLambda = 4 + floor(3*log(BI.dim));
+    validateattributes(control.normalProbeCount,{'numeric'}, ...
+        {'real','finite','scalar','integer','positive','<=',expectedLambda});
+    assert(control.horizonGenerations >= 2, ...
+        'BLCMAES:ExecutionControl', ...
+        'normalProbeAfterUpdate requires an intervention generation and one probe generation.');
+end
 % A legacy fixed-scale branch remains exactly equivalent to a constant
 % schedule.  The scale-outcome diagnostic supplies [eta, .5, .5, .5, .5]
 % so only its first resumed generation is an intervention.
