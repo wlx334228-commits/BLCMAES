@@ -37,6 +37,8 @@ results_scale_outcome_model_2D/
 results_scale_outcome_model_tests/
 results_nextgen_scale_2D/
 results_nextgen_scale_tests/
+results_fixed_auxiliary_scale_comparison_2D/
+results_fixed_auxiliary_scale_comparison_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/

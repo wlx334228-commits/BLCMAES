@@ -28,7 +28,8 @@ base = [1.0 0.2 0.1 0.0 0.0; ...
 C = base*base';
 [B,eigenvalues] = eig(C);
 CMA = struct('xmean',(BI.xrange(1,:)+BI.xrange(2,:))/2, ...
-    'sigma',0.02,'C',C,'B',B,'D',sqrt(diag(eigenvalues))');
+    'sigma',0.02,'C',C,'B',B,'D',sqrt(diag(eigenvalues))', ...
+    'pc',zeros(1,BI.dim),'ps',zeros(1,BI.dim));
 centre = CMA.xmean(1:BI.u_dim);
 rawUpper = repmat(centre,populationSize,1);
 rawLower = repmat(CMA.xmean(BI.u_dim+1:end),populationSize,1);
