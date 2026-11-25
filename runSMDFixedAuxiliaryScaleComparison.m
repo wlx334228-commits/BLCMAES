@@ -12,6 +12,8 @@ function experiment = runSMDFixedAuxiliaryScaleComparison( ...
 % whether to include A1, for example:
 %   runSMDFixedAuxiliaryScaleComparison([],10,1:8, ...
 %       struct('etas',[.10 .15 .20 .25],'includeA1',false));
+% Set includeA2=true for 6 normal + 2 auxiliary-only candidates. Its
+% independent scale is auxiliaryOnlyEta (default .20).
 %
 % The default is the requested formal study: SMD1--SMD8, 20 paired seeds.
 % It is resumable: each leaf experiment writes its own CSV and MAT records
@@ -48,7 +50,11 @@ snapshotFormalSources(projectRoot,outputRoot);
 smokeRoot = fullfile(outputRoot,'smoke_test_sampling');
 if exist(fullfile(smokeRoot,'auxiliary_sampling_scale_test_report.mat'), ...
         'file') ~= 2
-    testAuxiliarySamplingScaleSensitivity(smokeRoot,2000,studyOptions.etas);
+    samplingEtas = studyOptions.etas;
+    if studyOptions.includeA2
+        samplingEtas = unique([samplingEtas,studyOptions.auxiliaryOnlyEta]);
+    end
+    testAuxiliarySamplingScaleSensitivity(smokeRoot,2000,samplingEtas);
 else
     fprintf('Reuse completed sampling smoke test: %s\n',smokeRoot);
 end
@@ -59,7 +65,7 @@ for specIndex = 1:numel(specifications)
         'auxiliary eta=%s.\n'],spec.id,spec.normalCount,spec.directCount, ...
         spec.auxiliaryCount,displayEta(spec.reportedEta));
     runSMDPredictionInjection(spec.resultRoot,numberOfRuns,problemNumbers, ...
-        spec.injectCount,'direct_plus_auxiliary',5,40,'cma_gaussian', ...
+        spec.injectCount,spec.candidatePolicy,5,40,'cma_gaussian', ...
         spec.runnerEta);
 end
 
@@ -90,7 +96,8 @@ end
 function options = normaliseStudyOptions(options)
 assert(isstruct(options) && isscalar(options), ...
     'studyOptions must be a scalar structure.');
-defaults = struct('etas',[.25 .50],'includeA1',true);
+defaults = struct('etas',[.25 .50],'includeA1',true, ...
+    'includeA2',false,'auxiliaryOnlyEta',.20);
 names = fieldnames(defaults);
 for i = 1:numel(names)
     name = names{i};
@@ -105,12 +112,20 @@ assert(all(options.etas <= 1), ...
     'Auxiliary scale values must be no greater than one.');
 validateattributes(options.includeA1,{'logical','numeric'}, {'scalar'});
 options.includeA1 = logical(options.includeA1);
+validateattributes(options.includeA2,{'logical','numeric'}, {'scalar'});
+options.includeA2 = logical(options.includeA2);
+validateattributes(options.auxiliaryOnlyEta,{'numeric'}, ...
+    {'real','finite','scalar','positive','<=',1});
 end
 
 function specifications = fixedScaleSpecifications(outputRoot,options)
 specifications = makeSpec('A0',0,8,0,0,0.50,NaN,outputRoot);
 if options.includeA1
     specifications(end+1,1) = makeSpec('A1',1,7,1,0,0.50,NaN,outputRoot); %#ok<AGROW>
+end
+if options.includeA2
+    specifications(end+1,1) = makeSpec('A2',2,6,0,2, ...
+        options.auxiliaryOnlyEta,options.auxiliaryOnlyEta,outputRoot); %#ok<AGROW>
 end
 for eta = options.etas
     specifications(end+1,1) = makeSpec(scaleVariantId(eta),3,5,1,2, ...
@@ -125,7 +140,11 @@ assert(normalCount + directCount + auxiliaryCount == 8, ...
 spec = struct('id',id,'injectCount',injectCount, ...
     'normalCount',normalCount,'directCount',directCount, ...
     'auxiliaryCount',auxiliaryCount,'runnerEta',runnerEta, ...
-    'reportedEta',reportedEta,'resultRoot',fullfile(outputRoot,id));
+    'reportedEta',reportedEta,'resultRoot',fullfile(outputRoot,id), ...
+    'candidatePolicy','direct_plus_auxiliary');
+if auxiliaryCount > 0 && directCount == 0
+    spec.candidatePolicy = 'auxiliary_only';
+end
 end
 
 function comparisons = fixedScaleComparisons(options)
@@ -135,11 +154,20 @@ comparisons = cell(0,3);
 if options.includeA1
     comparisons(end+1,:) = {'A1_vs_A0','A0','A1'}; %#ok<AGROW>
 end
+if options.includeA2
+    comparisons(end+1,:) = {'A2_vs_A0','A0','A2'}; %#ok<AGROW>
+    if options.includeA1
+        comparisons(end+1,:) = {'A2_vs_A1','A1','A2'}; %#ok<AGROW>
+    end
+end
 for eta = options.etas
     id = scaleVariantId(eta);
     comparisons(end+1,:) = {[id '_vs_A0'],'A0',id}; %#ok<AGROW>
     if options.includeA1
         comparisons(end+1,:) = {[id '_vs_A1'],'A1',id}; %#ok<AGROW>
+    end
+    if options.includeA2
+        comparisons(end+1,:) = {[id '_vs_A2'],'A2',id}; %#ok<AGROW>
     end
 end
 if numel(options.etas) >= 2
@@ -162,21 +190,27 @@ config = struct('totalDim',5,'upperDim',2,'lowerDim',3, ...
     'populationSize',8,'numberOfRuns',numberOfRuns, ...
     'problemNumbers',problemNumbers,'sampleCount',40, ...
     'startGeneration',10,'historyGenerations',10, ...
-    'candidatePolicy','direct_plus_auxiliary', ...
+    'candidatePolicy','per_variant_see_specifications', ...
     'auxiliarySamplingDistribution','cma_gaussian', ...
     'predictionModelType','quadratic', ...
     'seedRule','seed=(SMD-1)*numberOfRuns+run_no', ...
     'specifications',serialiseSpecifications(specifications), ...
     'comparisons',{comparisons}, ...
-    'notes',['Only the auxiliary upper perturbation scale differs between ' ...
-        'the configured K3 variants.  A0 and A1, if included, use eta=0.50 ' ...
-        'only as an unused runner setting because they contain no auxiliary sample.']);
+    'notes',['K3 variants differ only in auxiliary scale. A2 uses two ' ...
+        'auxiliary-only candidates and no direct point; its scale and policy ' ...
+        'are stored in specifications. A0/A1 contain no auxiliary samples.']);
 if exist(configFile,'file') ~= 2
     save(configFile,'config');
     return;
 end
 loaded = load(configFile,'config');
 previous = loaded.config;
+% Older four/five-arm configurations predate this explicit per-arm field.
+if ~isfield(previous.specifications,'candidatePolicy')
+    for i = 1:numel(previous.specifications)
+        previous.specifications(i).candidatePolicy = 'direct_plus_auxiliary';
+    end
+end
 assert(previous.totalDim == config.totalDim && ...
     previous.numberOfRuns == config.numberOfRuns && ...
     isequal(previous.problemNumbers,config.problemNumbers) && ...

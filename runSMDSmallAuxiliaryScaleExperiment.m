@@ -1,8 +1,9 @@
 function experiment = runSMDSmallAuxiliaryScaleExperiment( ...
         outputRoot,numberOfRuns,problemNumbers)
 %RUNSMDSMALLAUXILIARYSCALEEXPERIMENT Complete small-eta comparison.
-% Runs five independent BL-CMA-ES variants to the original termination
-% condition: A0 and K3 with eta = .10/.15/.20/.25.  Unlike the separate
+% Runs eight independent BL-CMA-ES variants to the original termination
+% condition: A0, A1 (direct only), A2 (two auxiliary only, eta=.20),
+% and K3 with eta = .10/.15/.25/.50/1.00. Unlike the separate
 % next-generation diagnostic, every branch produces terminal upper/lower
 % errors, total UFE, total LFE, success rates, and paired statistics.
 %
