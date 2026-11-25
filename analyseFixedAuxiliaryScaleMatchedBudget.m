@@ -1,11 +1,13 @@
 function [matchedRuns,matchedSummary,pairedTests] = ...
     analyseFixedAuxiliaryScaleMatchedBudget( ...
-    outputRoot,runs,problemNumbers,comparisons)
+    outputRoot,runs,problemNumbers,comparisons,significanceMode)
 %ANALYSEFIXEDAUXILIARYSCALEMATCHEDBUDGET Compare paired variants at a
 % common true upper-level evaluation budget.  This is read-only: it walks
-% the evaluation logs saved by the four formal branches and never invokes
+% the evaluation logs saved by the configured variants and never invokes
 % an SMD objective or lower-level optimizer.
 
+if nargin < 5, significanceMode = 'holm'; end
+significanceMode = validatestring(significanceMode,{'raw','holm'});
 required = {'SMD','variant','run_no','seed','UFE','mat_file', ...
     'result_directory'};
 assert(istable(runs) && all(ismember(required,runs.Properties.VariableNames)), ...
@@ -35,7 +37,7 @@ for smdNo = problemNumbers(:)'
     end
 end
 matchedRuns = cell2table(rows,'VariableNames',runNames);
-[matchedSummary,pairedTests] = summariseMatchedRuns(matchedRuns);
+[matchedSummary,pairedTests] = summariseMatchedRuns(matchedRuns,significanceMode);
 writetable(matchedRuns, ...
     fullfile(outputRoot,'fixed_scale_matched_budget_runs.csv'));
 writetable(matchedSummary, ...
@@ -79,7 +81,7 @@ end
 assert(isfinite(errorValue),'No finite upper evaluation found in %s.',matFile);
 end
 
-function [summary,tests] = summariseMatchedRuns(runs)
+function [summary,tests] = summariseMatchedRuns(runs,significanceMode)
 summaryNames = {'SMD','comparison','reference_variant','variant', ...
     'paired_runs','common_UFE_median','reference_upper_error_median', ...
     'variant_upper_error_median','error_delta_median', ...
@@ -107,12 +109,18 @@ for i = 1:height(keys)
 end
 summary = cell2table(summaryRows,'VariableNames',summaryNames);
 tests = cell2table(testRows,'VariableNames',testNames);
-for smdNo = unique(tests.SMD)'
-    index = tests.SMD == smdNo;
-    tests.upper_error_p_holm(index) = holmAdjust(tests.upper_error_p(index));
+if strcmp(significanceMode,'raw')
+    tests.upper_error_advantage = tests.upper_error_p < .05 & ...
+        tests.variant_upper_error_median < tests.reference_upper_error_median;
+    tests.upper_error_p_holm = [];
+else
+    for smdNo = unique(tests.SMD)'
+        index = tests.SMD == smdNo;
+        tests.upper_error_p_holm(index) = holmAdjust(tests.upper_error_p(index));
+    end
+    tests.upper_error_advantage = tests.upper_error_p_holm < 0.05 & ...
+        tests.variant_upper_error_median < tests.reference_upper_error_median;
 end
-tests.upper_error_advantage = tests.upper_error_p_holm < 0.05 & ...
-    tests.variant_upper_error_median < tests.reference_upper_error_median;
 end
 
 function adjusted = holmAdjust(pValues)

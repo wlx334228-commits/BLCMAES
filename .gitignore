@@ -43,6 +43,8 @@ results_fixed_auxiliary_scale_comparison_2D/
 results_fixed_auxiliary_scale_comparison_tests/
 results_small_auxiliary_scale_full_comparison_2D/
 results_small_auxiliary_scale_full_comparison_tests/
+results_large_auxiliary_scale_full_comparison_2D/
+results_large_auxiliary_scale_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/

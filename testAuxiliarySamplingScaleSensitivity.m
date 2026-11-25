@@ -15,7 +15,6 @@ if nargin < 3 || isempty(etas), etas = [0.25,0.5,0.75,1.0]; end
 validateattributes(replications,{'numeric'},{'scalar','integer','>=',1000});
 validateattributes(etas,{'numeric'}, {'real','finite','vector','nonempty','positive'});
 etas = sort(unique(double(etas(:)')));
-assert(all(etas <= 1), 'Auxiliary sampling scales must be no greater than one.');
 if exist(outputDir,'dir') ~= 7, mkdir(outputDir); end
 
 BI = getBLOPinfo('SMD',1,5);
@@ -88,6 +87,9 @@ for eta = etas
         'Normal CMA-ES candidates changed for eta=%.2g.',eta);
     assert(norm(upper(6,:)-centre) < 1e-12, ...
         'The direct prediction changed for eta=%.2g.',eta);
+    assert(isequal(entry.auxiliary_raw_joint(:,BI.u_dim+1:end), ...
+        entryOne.auxiliary_raw_joint(:,BI.u_dim+1:end)), ...
+        'Auxiliary lower-coordinate draws changed for eta=%.2g.',eta);
     assert(norm(entry.auxiliary_upper_raw_offsets-eta*oneOffsets,'fro') < 1e-12, ...
         'Auxiliary perturbations do not scale exactly by eta=%.2g.',eta);
     assert(norm(entry.auxiliary_upper_target_covariance-eta^2*targetOne,'fro') < ...
@@ -125,6 +127,31 @@ expectedRatios = etas' / etas(end);
 assert(max(abs(ratios-expectedRatios)) < 0.06, ...
     'Empirical auxiliary standard-deviation ratios do not match eta.');
 report.empiricalRmsStdRatios = ratios;
+
+% Exercise the existing repair rule near a boundary, including enlarged
+% scales. This uses only private-stream samples and no true evaluations.
+boundaryCMA = CMA;
+boundaryCMA.sigma = .7;
+boundaryCMA.xmean(1:BI.u_dim) = BI.u_ub - ...
+    1e-8*(BI.u_ub-BI.u_lb);
+options = etaOptions(BI,3,max(etas));
+state = initializePredictionInjectionState(BI,options);
+state.pending = pendingPrediction(boundaryCMA.xmean(1:BI.u_dim));
+repaired = 0;
+rngBefore = rng;
+for i = 1:64
+    [~,~,entry,state] = applyPredictionInjection(boundaryCMA, ...
+        rawUpper,rawLower,11,BI,options,state);
+    actual = entry.auxiliary_actual_joint(:,1:BI.u_dim);
+    assert(all(all(actual >= BI.u_lb & actual <= BI.u_ub)), ...
+        'Auxiliary boundary repair produced an infeasible upper candidate.');
+    actualOffsets = bsxfun(@minus,actual,entry.x_pred_actual);
+    assert(norm(actualOffsets-entry.auxiliary_upper_actual_offsets,'fro')<1e-12);
+    repaired = repaired + sum(any(entry.auxiliary_boundary_repaired(:,1:BI.u_dim),2));
+end
+assert(repaired>0 && isequal(rngBefore,rng), ...
+    'Boundary test did not exercise repair or changed the global RNG.');
+report.boundaryRepairedCandidates = repaired;
 save(fullfile(outputDir,'auxiliary_sampling_scale_test_report.mat'), ...
     'report');
 disp(report);

@@ -1,9 +1,11 @@
 function [summary,pairedTests] = summariseFixedAuxiliaryScaleComparison( ...
-    runs,specifications,problemNumbers,comparisons)
-%SUMMARISEFIXEDAUXILIARYSCALECOMPARISON Read-only four-arm aggregation.
+    runs,specifications,problemNumbers,comparisons,significanceMode)
+%SUMMARISEFIXEDAUXILIARYSCALECOMPARISON Read-only multi-arm aggregation.
 % This routine does not call an SMD objective or alter any saved run.  It
 % treats an independent run, never an individual generation, as one sample.
 
+if nargin < 5, significanceMode = 'holm'; end
+significanceMode = validatestring(significanceMode,{'raw','holm'});
 required = {'SMD','variant','run_no','seed','upper_error','lower_error', ...
     'upper_success','lower_success','UFE','LFE_total','first_hit_UFE', ...
     'first_hit_LFE','prediction_injected_generations', ...
@@ -54,10 +56,10 @@ for smdNo = problemNumbers(:)'
     end
 end
 summary = cell2table(rows,'VariableNames',names);
-pairedTests = buildPairedTests(runs,problemNumbers,comparisons);
+pairedTests = buildPairedTests(runs,problemNumbers,comparisons,significanceMode);
 end
 
-function tests = buildPairedTests(runs,problemNumbers,comparisons)
+function tests = buildPairedTests(runs,problemNumbers,comparisons,significanceMode)
 names = {'SMD','comparison','reference_variant','variant', ...
     'paired_runs','reference_upper_successes','variant_upper_successes', ...
     'reference_lower_successes','variant_lower_successes', ...
@@ -106,7 +108,19 @@ for smdNo = problemNumbers(:)'
     end
 end
 tests = cell2table(rows,'VariableNames',names);
-tests = applyHolmAndAdvantages(tests);
+if strcmp(significanceMode,'raw')
+    % Raw significance describes each individual metric. Success counts and
+    % acceleration eligibility remain separate reported information.
+    metrics = {'upper_error','lower_error','UFE','LFE'};
+    for i = 1:numel(metrics)
+        m = metrics{i};
+        tests.([m '_advantage']) = tests.([m '_p']) < .05 & ...
+            tests.(['variant_' m '_median']) < tests.(['reference_' m '_median']);
+    end
+    tests(:,strcat(metrics,'_p_holm')) = [];
+else
+    tests = applyHolmAndAdvantages(tests);
+end
 end
 
 function [reference,variant] = alignPairs(reference,variant,smdNo,comparison)
