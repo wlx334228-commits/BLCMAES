@@ -1,8 +1,11 @@
-function result = analyseNextGenerationScaleModels(outcomes)
+function result = analyseNextGenerationScaleModels(outcomes,analysisOptions)
 %ANALYSENEXTGENERATIONSCALEMODELS Grouped-CV M0/M1 next-generation study.
 % The response is the matched, real t+1 normal-probe top-two UF difference
-% R=(Q(eta)-Q(.50))/s_ref.  K3 scale branches alone train the models; A1 is
-% intentionally summarized as a structural control, not treated as an eta.
+% R=(Q(eta)-Q(reference))/s_ref.  K3 scale branches alone train the models;
+% structural controls (A0 or A1) never become an eta training observation.
+
+if nargin < 2 || isempty(analysisOptions), analysisOptions = struct(); end
+settings = normaliseAnalysisSettings(analysisOptions);
 
 required = {'SMD','run_no','state_index','repeat_no','variant', ...
     'candidate_policy','eta','is_scale_branch','probe_completed','d','q', ...
@@ -38,30 +41,30 @@ for smd = unique(collapsed.SMD)'
         for specIndex = 1:size(specs,1)
             spec = struct('name',specs{specIndex,1}, ...
                 'useD',specs{specIndex,2},'useQ',specs{specIndex,3});
-            model = fitModel(trainRows,spec);
+            model = fitModel(trainRows,spec,settings);
             parameterRows(end+1,1) = parameterRow(model,smd,fold,spec, ...
                 numel(unique(trainRows.run_no)),stateCount(trainRows)); %#ok<AGROW>
             states = unique(testRows(:,{'run_no','state_index'}),'rows','stable');
             for i = 1:height(states)
                 rows = sortrows(testRows(testRows.run_no == states.run_no(i) & ...
                     testRows.state_index == states.state_index(i),:),'eta');
-                assert(height(rows) == 4 && all(abs(rows.eta(:)-[.25;.5;.75;1]) < 1e-12), ...
-                    'A complete matched eta quartet is required for every test state.');
+                assertMatchedEtaSet(rows,settings.etas);
                 predicted = predictModel(model,rows);
                 for j = 1:height(rows)
                     predictionRows(end+1,1) = predictionRow(rows(j,:), ...
                         spec.name,fold,predicted(j)); %#ok<AGROW>
                 end
                 selectionRows = [selectionRows;modelSelectionRows(rows,predicted, ...
-                    spec.name,fold,true)]; %#ok<AGROW>
+                    spec.name,fold,true,settings)]; %#ok<AGROW>
             end
         end
         states = unique(testRows(:,{'run_no','state_index'}),'rows','stable');
         for i = 1:height(states)
             rows = sortrows(testRows(testRows.run_no == states.run_no(i) & ...
                 testRows.state_index == states.state_index(i),:),'eta');
+            assertMatchedEtaSet(rows,settings.etas);
             selectionRows = [selectionRows;modelSelectionRows(rows,NaN(height(rows),1), ...
-                'fixed',fold,false)]; %#ok<AGROW>
+                'fixed',fold,false,settings)]; %#ok<AGROW>
         end
     end
 end
@@ -71,12 +74,52 @@ predictionTable = struct2table(predictionRows);
 selectionTable = struct2table(selectionRows);
 metricTable = makeMetricTable(predictionTable);
 strategySummary = makeStrategySummary(selectionTable);
-pairedTests = makePairedTests(selectionTable);
+pairedTests = makePairedTests(selectionTable,settings);
 a1Summary = makeA1Summary(outcomes);
+referenceTests = makeReferenceComparisonTests(collapsed,settings);
 result = struct('collapsedOutcomes',collapsed,'parameterTable',parameterTable, ...
     'predictionTable',predictionTable,'selectionTable',selectionTable, ...
     'metricTable',metricTable,'strategySummary',strategySummary, ...
-    'pairedTests',pairedTests,'a1Summary',a1Summary);
+    'pairedTests',pairedTests,'a1Summary',a1Summary, ...
+    'referenceTests',referenceTests,'analysisSettings',settings);
+end
+
+function settings = normaliseAnalysisSettings(requested)
+defaults = struct('etas',[.25 .50 .75 1.00], ...
+    'referenceVariant','eta_050','responseMode','anchored_eta', ...
+    'fallbackEta',.50);
+assert(isstruct(requested) && isscalar(requested), ...
+    'analysisOptions must be one scalar structure.');
+names = fieldnames(requested);
+for i = 1:numel(names)
+    assert(isfield(defaults,names{i}), ...
+        'Unknown next-generation analysis option: %s.',names{i});
+    defaults.(names{i}) = requested.(names{i});
+end
+settings = defaults;
+settings.etas = sort(settings.etas(:)');
+validateattributes(settings.etas,{'numeric'}, ...
+    {'real','finite','positive','vector','nonempty'});
+assert(numel(unique(settings.etas)) == numel(settings.etas), ...
+    'Analysis eta values must be unique.');
+settings.referenceVariant = char(settings.referenceVariant);
+settings.responseMode = char(settings.responseMode);
+validateattributes(settings.fallbackEta,{'numeric'}, ...
+    {'real','finite','scalar','positive'});
+assert(any(abs(settings.etas-settings.fallbackEta) < 1e-12), ...
+    'fallbackEta must be one of the analysed scale values.');
+assert(ismember(settings.responseMode,{'anchored_eta','baseline_relative'}), ...
+    'responseMode must be anchored_eta or baseline_relative.');
+if strcmp(settings.responseMode,'anchored_eta')
+    assert(any(abs(settings.etas-.50) < 1e-12), ...
+        'anchored_eta analysis requires eta=.50.');
+end
+end
+
+function assertMatchedEtaSet(rows,etas)
+assert(height(rows) == numel(etas) && ...
+    all(abs(rows.eta(:)-etas(:)) < 1e-12), ...
+    'A complete matched set of configured eta branches is required for every test state.');
 end
 
 function collapsed = collapseRepeats(rows)
@@ -102,22 +145,23 @@ end
 collapsed = sortrows(struct2table(items),{'SMD','run_no','state_index','eta'});
 end
 
-function model = fitModel(rows,spec)
+function model = fitModel(rows,spec,settings)
 model = struct('name',spec.name,'useD',spec.useD,'useQ',spec.useQ, ...
     'beta',NaN(0,1),'lambda',NaN,'d_mean',NaN,'d_std',NaN, ...
-    'q_mean',NaN,'q_std',NaN,'status','insufficient_data');
+    'q_mean',NaN,'q_std',NaN,'status','insufficient_data', ...
+    'responseMode',settings.responseMode,'fallbackEta',settings.fallbackEta);
 valid = isfinite(rows.R_stable) & isfinite(rows.d) & isfinite(rows.q);
 rows = rows(valid,:);
 if height(rows) < 8, return; end
 [X,model] = designMatrix(rows,model,true);
 y = rows.R_stable;
 candidateLambda = [0,1e-6,1e-4,1e-2,1,10];
-model.lambda = chooseLambda(rows,spec,candidateLambda);
+model.lambda = chooseLambda(rows,spec,candidateLambda,settings);
 model.beta = (X'*X + model.lambda*eye(size(X,2))) \ (X'*y);
 if all(isfinite(model.beta)), model.status='fitted'; else, model.status='nonfinite_solution'; end
 end
 
-function lambda = chooseLambda(rows,spec,candidates)
+function lambda = chooseLambda(rows,spec,candidates,settings)
 runs = unique(rows.run_no);
 if numel(runs) < 3, lambda = 1e-2; return; end
 loss = Inf(size(candidates));
@@ -127,7 +171,8 @@ for l = 1:numel(candidates)
         train = rows(rows.run_no ~= r,:); test = rows(rows.run_no == r,:);
         model = struct('name',spec.name,'useD',spec.useD,'useQ',spec.useQ, ...
             'beta',NaN(0,1),'lambda',candidates(l),'d_mean',NaN,'d_std',NaN, ...
-            'q_mean',NaN,'q_std',NaN,'status','');
+            'q_mean',NaN,'q_std',NaN,'status','', ...
+            'responseMode',settings.responseMode,'fallbackEta',settings.fallbackEta);
         [Xtrain,model] = designMatrix(train,model,true);
         beta = (Xtrain'*Xtrain+candidates(l)*eye(size(Xtrain,2))) \ (Xtrain'*train.R_stable);
         model.beta = beta; prediction = predictModel(model,test);
@@ -139,16 +184,27 @@ end
 end
 
 function [X,model] = designMatrix(rows,model,fitNormalizer)
-u = rows.eta(:)-.50; u2=u.^2;
+eta = rows.eta(:);
+u = eta-.50; u2=u.^2;
 d = log(1+max(rows.d(:),0)); q = log(1+max(rows.q(:),0));
 if fitNormalizer
     model.d_mean=mean(d,'omitnan'); model.d_std=max(std(d,0,'omitnan'),sqrt(eps));
     model.q_mean=mean(q,'omitnan'); model.q_std=max(std(q,0,'omitnan'),sqrt(eps));
 end
 d=(d-model.d_mean)/model.d_std; q=(q-model.q_mean)/model.q_std;
-X=[u,u2];
-if model.useD, X=[X,d.*u,d.*u2]; end %#ok<AGROW>
-if model.useQ, X=[X,q.*u,q.*u2]; end %#ok<AGROW>
+if strcmp(model.responseMode,'anchored_eta')
+    % The legacy response is exactly zero at eta=.50 by construction.
+    X=[u,u2];
+    if model.useD, X=[X,d.*u,d.*u2]; end %#ok<AGROW>
+    if model.useQ, X=[X,q.*u,q.*u2]; end %#ok<AGROW>
+else
+    % For A0-referenced responses, every tested eta may depart from zero.
+    % Retain an intercept and state main effects, then add the same
+    % first-/second-order state-by-scale interactions used by the legacy M1.
+    X=[ones(size(eta)),eta,eta.^2];
+    if model.useD, X=[X,d,d.*eta,d.*eta.^2]; end %#ok<AGROW>
+    if model.useQ, X=[X,q,q.*eta,q.*eta.^2]; end %#ok<AGROW>
+end
 end
 
 function prediction = predictModel(model,rows)
@@ -156,21 +212,22 @@ if isempty(model.beta) || any(~isfinite(model.beta)), prediction=NaN(height(rows
 [X,~]=designMatrix(rows,model,false); prediction=X*model.beta;
 end
 
-function rows = modelSelectionRows(discrete,predicted,policy,fold,isModel)
+function rows = modelSelectionRows(discrete,predicted,policy,fold,isModel,settings)
 [oracleValue,~] = max(discrete.R_stable);
 oracle = discrete(abs(discrete.R_stable-oracleValue) <= 1e-12*max(1,abs(oracleValue)),:);
-oracleEta = tieEta(oracle.eta);
+    oracleEta = tieEta(oracle.eta,settings.fallbackEta);
 rows = repmat(emptySelectionRow(),0,1);
 if isModel
     if any(~isfinite(predicted))
-        eta = .50; predicted(:) = NaN;
+        eta = settings.fallbackEta; predicted(:) = NaN;
     else
-        eta = tieEta(discrete.eta(abs(predicted-max(predicted)) <= 1e-12*max(1,abs(max(predicted)))));
+        eta = tieEta(discrete.eta(abs(predicted-max(predicted)) <= ...
+            1e-12*max(1,abs(max(predicted)))),settings.fallbackEta);
     end
     chosen = discrete(abs(discrete.eta-eta) < 1e-12,:);
     rows(end+1,1)=selectionRow(chosen,policy,fold,predicted(find(abs(discrete.eta-eta)<1e-12,1)),oracleEta,oracleValue); %#ok<AGROW>
 else
-    for eta = [.25 .50 .75 1]
+    for eta = settings.etas
         chosen=discrete(abs(discrete.eta-eta)<1e-12,:);
         rows(end+1,1)=selectionRow(chosen,sprintf('fixed_eta_%03d',round(100*eta)),fold,NaN,oracleEta,oracleValue); %#ok<AGROW>
     end
@@ -187,8 +244,8 @@ row.raw_regret_to_oracle=oracleValue-chosen.R_stable;
 row.selected_matches_oracle=double(abs(chosen.eta-oracleEta)<1e-12);
 end
 
-function value = tieEta(etas)
-etas=etas(:); [~,order]=sortrows([abs(etas-.5),etas],[1 2]); value=etas(order(1));
+function value = tieEta(etas,target)
+etas=etas(:); [~,order]=sortrows([abs(etas-target),etas],[1 2]); value=etas(order(1));
 end
 
 function tableData = makeMetricTable(predictions)
@@ -241,10 +298,64 @@ end
 tableData=struct2table(rows);
 end
 
-function tableData = makePairedTests(selection)
-comparisons = {'M1','M0';'M1','M1_d_only';'M1','M1_q_only'; ...
-    'M1','fixed_eta_025';'M1','fixed_eta_050'; ...
-    'M1','fixed_eta_075';'M1','fixed_eta_100'};
+function tests = makeReferenceComparisonTests(collapsed,settings)
+% Collapse repeated states inside each independent main run before testing.
+% Thus a long run that produces many valid prediction generations cannot be
+% mistaken for many statistically independent comparisons.
+rows = repmat(emptyReferenceTestRow(),0,1);
+for smd = unique(collapsed.SMD)'
+    for eta = settings.etas
+        part = collapsed(collapsed.SMD == smd & abs(collapsed.eta-eta) < 1e-12,:);
+        runNumbers = unique(part.run_no);
+        values = NaN(numel(runNumbers),1);
+        rawValues = NaN(numel(runNumbers),1);
+        for i = 1:numel(runNumbers)
+            subset = part(part.run_no == runNumbers(i),:);
+            values(i) = mean(subset.R_stable,'omitnan');
+            rawValues(i) = mean(subset.raw_delta_Q,'omitnan');
+        end
+        finite = isfinite(values);
+        result = pairedWilcoxonSignedRank(values(finite),zeros(sum(finite),1));
+        row = emptyReferenceTestRow();
+        row.SMD=smd; row.reference_variant=settings.referenceVariant; row.eta=eta;
+        row.independent_runs=sum(finite); row.R_median=median(values(finite),'omitnan');
+        row.R_IQR=iqrValue(values(finite));
+        row.raw_delta_Q_median=median(rawValues(finite),'omitnan');
+        row.raw_delta_Q_IQR=iqrValue(rawValues(finite));
+        row.p_value=result.p; row.significant_0_05=double(result.h);
+        row.method=result.method; row.positive_median_advantage=double(row.R_median > 0);
+        rows(end+1,1)=row; %#ok<AGROW>
+    end
+end
+tests = struct2table(rows);
+for smd = unique(tests.SMD)'
+    subset = tests.SMD == smd;
+    tests.p_value_holm(subset) = holmAdjust(tests.p_value(subset));
+    tests.significant_positive_advantage(subset) = ...
+        double(tests.p_value_holm(subset) < .05 & ...
+        tests.R_median(subset) > 0);
+end
+end
+
+function adjusted = holmAdjust(values)
+adjusted = NaN(size(values));
+finite = find(isfinite(values));
+if isempty(finite), return; end
+[ordered,order] = sort(values(finite));
+count = numel(ordered); corrected = zeros(size(ordered)); running = 0;
+for i = 1:count
+    running = max(running,(count-i+1)*ordered(i));
+    corrected(i) = min(running,1);
+end
+positions = finite(order); adjusted(positions) = corrected;
+end
+
+function tableData = makePairedTests(selection,settings)
+fixedComparisons = arrayfun(@(eta){'M1', ...
+    sprintf('fixed_eta_%03d',round(100*eta))},settings.etas, ...
+    'UniformOutput',false);
+comparisons = [{'M1','M0'};{'M1','M1_d_only'};{'M1','M1_q_only'}; ...
+    vertcat(fixedComparisons{:})];
 rows = repmat(emptyPairedTestRow(),0,1);
 for smd = unique(selection.SMD)'
     for i = 1:size(comparisons,1)
@@ -286,9 +397,26 @@ end
 function row=parameterRow(model,smd,fold,spec,runCount,stateCountValue)
 row=statusParameterRow(smd,spec.name,model.status); row.fold=fold; row.training_runs=runCount; row.training_states=stateCountValue;
 row.lambda=model.lambda; row.d_log_mean=model.d_mean; row.d_log_std=model.d_std; row.q_log_mean=model.q_mean; row.q_log_std=model.q_std;
-b=model.beta; if numel(b)>=2,row.a1=b(1);row.a2=b(2);end
-position=3; if spec.useD && numel(b)>=position+1,row.b_d_u=b(position);row.c_d_u2=b(position+1);position=position+2;end
-if spec.useQ && numel(b)>=position+1,row.b_q_u=b(position);row.c_q_u2=b(position+1);end
+b=model.beta;
+if strcmp(model.responseMode,'anchored_eta')
+    if numel(b)>=2,row.a1=b(1);row.a2=b(2);end
+    position=3;
+    if spec.useD && numel(b)>=position+1
+        row.b_d_u=b(position);row.c_d_u2=b(position+1);position=position+2;
+    end
+    if spec.useQ && numel(b)>=position+1
+        row.b_q_u=b(position);row.c_q_u2=b(position+1);
+    end
+else
+    if numel(b)>=3, row.a0=b(1);row.a1=b(2);row.a2=b(3);end
+    position=4;
+    if spec.useD && numel(b)>=position+2
+        row.b_d=b(position);row.b_d_u=b(position+1);row.c_d_u2=b(position+2);position=position+3;
+    end
+    if spec.useQ && numel(b)>=position+2
+        row.b_q=b(position);row.b_q_u=b(position+1);row.c_q_u2=b(position+2);
+    end
+end
 end
 function row=statusParameterRow(smd,model,status)
 row=emptyParameterRow();row.SMD=smd;row.model=model;row.status=status;
@@ -298,10 +426,11 @@ row=emptyPredictionRow();row.SMD=observed.SMD;row.run_no=observed.run_no;row.sta
 end
 
 function row=emptyCollapsedRow(), row=struct('SMD',NaN,'run_no',NaN,'state_index',NaN,'eta',NaN,'repeat_count',NaN,'d',NaN,'q',NaN,'s_ref',NaN,'generation',NaN,'Q_top2_UF',NaN,'raw_delta_Q',NaN,'R_stable',NaN,'mean_upper_error',NaN,'mean_lower_error',NaN,'probe_UFE_delta',NaN,'probe_LFE_delta',NaN);end
-function row=emptyParameterRow(),row=struct('SMD',NaN,'fold',NaN,'model','','status','','training_runs',NaN,'training_states',NaN,'lambda',NaN,'d_log_mean',NaN,'d_log_std',NaN,'q_log_mean',NaN,'q_log_std',NaN,'a1',NaN,'a2',NaN,'b_d_u',NaN,'c_d_u2',NaN,'b_q_u',NaN,'c_q_u2',NaN);end
+function row=emptyParameterRow(),row=struct('SMD',NaN,'fold',NaN,'model','','status','','training_runs',NaN,'training_states',NaN,'lambda',NaN,'d_log_mean',NaN,'d_log_std',NaN,'q_log_mean',NaN,'q_log_std',NaN,'a0',NaN,'a1',NaN,'a2',NaN,'b_d',NaN,'b_d_u',NaN,'c_d_u2',NaN,'b_q',NaN,'b_q_u',NaN,'c_q_u2',NaN);end
 function row=emptyPredictionRow(),row=struct('SMD',NaN,'run_no',NaN,'state_index',NaN,'generation',NaN,'eta',NaN,'model','','fold',NaN,'d',NaN,'q',NaN,'actual_R',NaN,'predicted_R',NaN,'actual_raw_delta_Q',NaN);end
 function row=emptySelectionRow(),row=struct('SMD',NaN,'run_no',NaN,'state_index',NaN,'generation',NaN,'fold',NaN,'policy','','selected_eta',NaN,'predicted_R',NaN,'actual_R',NaN,'actual_raw_delta_Q',NaN,'oracle_eta',NaN,'oracle_R',NaN,'raw_regret_to_oracle',NaN,'selected_matches_oracle',NaN);end
 function row=emptyMetricRow(),row=struct('SMD',NaN,'model','','run_no',NaN,'MAE',NaN,'RMSE',NaN);end
 function row=emptyStrategyRow(),row=struct('SMD',NaN,'policy','','independent_runs',NaN,'R_median',NaN,'R_IQR',NaN,'raw_delta_Q_median',NaN,'raw_delta_Q_IQR',NaN,'oracle_match_rate',NaN);end
 function row=emptyA1Row(),row=struct('SMD',NaN,'run_no',NaN,'mean_R',NaN,'mean_raw_delta_Q',NaN,'state_count',NaN);end
+function row=emptyReferenceTestRow(),row=struct('SMD',NaN,'reference_variant','','eta',NaN,'independent_runs',NaN,'R_median',NaN,'R_IQR',NaN,'raw_delta_Q_median',NaN,'raw_delta_Q_IQR',NaN,'p_value',NaN,'p_value_holm',NaN,'significant_0_05',NaN,'positive_median_advantage',NaN,'significant_positive_advantage',NaN,'method','');end
 function row=emptyPairedTestRow(),row=struct('SMD',NaN,'policy_A','','policy_B','','independent_runs',NaN,'delta_R_median',NaN,'p_value',NaN,'significant_0_05',NaN,'method','');end

@@ -1,11 +1,17 @@
 function experiment = runSMDFixedAuxiliaryScaleComparison( ...
-    outputRoot,numberOfRuns,problemNumbers)
-%RUNSMDFIXEDAUXILIARYSCALECOMPARISON Formal A0/A1/K3-scale comparison.
-% At (DU,DL)=(2,3), compare four complete BL-CMA-ES runs:
-%   A0        8 normal CMA-ES candidates;
-%   A1        7 normal candidates + 1 direct quadratic prediction;
-%   K3_eta025 5 normal + 1 direct + 2 auxiliary candidates, eta=0.25;
-%   K3_eta050 5 normal + 1 direct + 2 auxiliary candidates, eta=0.50.
+    outputRoot,numberOfRuns,problemNumbers,studyOptions)
+%RUNSMDFIXEDAUXILIARYSCALECOMPARISON Complete A0/A1/K3-scale comparison.
+% At (DU,DL)=(2,3), every listed variant runs independently from its
+% initial population to the original BL-CMA-ES termination condition.  The
+% reported upper/lower errors and UFE/LFE are therefore terminal metrics,
+% not a one-generation diagnostic quantity.
+%
+% With no studyOptions, retain the historical four-arm study:
+%   A0, A1, K3_eta025, K3_eta050.
+% A caller can select an arbitrary K3 auxiliary scale list and choose
+% whether to include A1, for example:
+%   runSMDFixedAuxiliaryScaleComparison([],10,1:8, ...
+%       struct('etas',[.10 .15 .20 .25],'includeA1',false));
 %
 % The default is the requested formal study: SMD1--SMD8, 20 paired seeds.
 % It is resumable: each leaf experiment writes its own CSV and MAT records
@@ -22,6 +28,7 @@ if nargin < 1 || isempty(outputRoot)
 end
 if nargin < 2 || isempty(numberOfRuns), numberOfRuns = 20; end
 if nargin < 3 || isempty(problemNumbers), problemNumbers = 1:8; end
+if nargin < 4 || isempty(studyOptions), studyOptions = struct(); end
 validateattributes(numberOfRuns,{'numeric'},{'scalar','integer','positive'});
 validateattributes(problemNumbers,{'numeric'}, ...
     {'vector','integer','>=',1,'<=',8});
@@ -29,8 +36,9 @@ assert(numel(unique(problemNumbers)) == numel(problemNumbers), ...
     'problemNumbers must not contain duplicates.');
 if exist(outputRoot,'dir') ~= 7, mkdir(outputRoot); end
 
-specifications = fixedScaleSpecifications(outputRoot);
-comparisons = fixedScaleComparisons();
+studyOptions = normaliseStudyOptions(studyOptions);
+specifications = fixedScaleSpecifications(outputRoot,studyOptions);
+comparisons = fixedScaleComparisons(studyOptions);
 saveOrValidateConfiguration(outputRoot,numberOfRuns,problemNumbers, ...
     specifications,comparisons);
 snapshotFormalSources(projectRoot,outputRoot);
@@ -40,7 +48,7 @@ snapshotFormalSources(projectRoot,outputRoot);
 smokeRoot = fullfile(outputRoot,'smoke_test_sampling');
 if exist(fullfile(smokeRoot,'auxiliary_sampling_scale_test_report.mat'), ...
         'file') ~= 2
-    testAuxiliarySamplingScaleSensitivity(smokeRoot);
+    testAuxiliarySamplingScaleSensitivity(smokeRoot,2000,studyOptions.etas);
 else
     fprintf('Reuse completed sampling smoke test: %s\n',smokeRoot);
 end
@@ -79,12 +87,35 @@ fprintf(['\nFixed auxiliary-scale comparison completed: %s\n' ...
     'fixed_scale_paired_wilcoxon.csv\n'],outputRoot);
 end
 
-function specifications = fixedScaleSpecifications(outputRoot)
-specifications = [ ...
-    makeSpec('A0',0,8,0,0,0.50,NaN,outputRoot); ...
-    makeSpec('A1',1,7,1,0,0.50,NaN,outputRoot); ...
-    makeSpec('K3_eta025',3,5,1,2,0.25,0.25,outputRoot); ...
-    makeSpec('K3_eta050',3,5,1,2,0.50,0.50,outputRoot)];
+function options = normaliseStudyOptions(options)
+assert(isstruct(options) && isscalar(options), ...
+    'studyOptions must be a scalar structure.');
+defaults = struct('etas',[.25 .50],'includeA1',true);
+names = fieldnames(defaults);
+for i = 1:numel(names)
+    name = names{i};
+    if ~isfield(options,name) || isempty(options.(name))
+        options.(name) = defaults.(name);
+    end
+end
+validateattributes(options.etas,{'numeric'}, ...
+    {'real','finite','vector','nonempty','positive'});
+options.etas = sort(unique(double(options.etas(:)')));
+assert(all(options.etas <= 1), ...
+    'Auxiliary scale values must be no greater than one.');
+validateattributes(options.includeA1,{'logical','numeric'}, {'scalar'});
+options.includeA1 = logical(options.includeA1);
+end
+
+function specifications = fixedScaleSpecifications(outputRoot,options)
+specifications = makeSpec('A0',0,8,0,0,0.50,NaN,outputRoot);
+if options.includeA1
+    specifications(end+1,1) = makeSpec('A1',1,7,1,0,0.50,NaN,outputRoot); %#ok<AGROW>
+end
+for eta = options.etas
+    specifications(end+1,1) = makeSpec(scaleVariantId(eta),3,5,1,2, ...
+        eta,eta,outputRoot); %#ok<AGROW>
+end
 end
 
 function spec = makeSpec(id,injectCount,normalCount,directCount, ...
@@ -97,16 +128,31 @@ spec = struct('id',id,'injectCount',injectCount, ...
     'reportedEta',reportedEta,'resultRoot',fullfile(outputRoot,id));
 end
 
-function comparisons = fixedScaleComparisons()
-% All comparisons are paired by SMD and run number.  The last comparison
-% directly tests the proposed eta=0.25 replacement for eta=0.50.
-comparisons = { ...
-    'A1_vs_A0','A0','A1'; ...
-    'K3_eta025_vs_A0','A0','K3_eta025'; ...
-    'K3_eta050_vs_A0','A0','K3_eta050'; ...
-    'K3_eta025_vs_A1','A1','K3_eta025'; ...
-    'K3_eta050_vs_A1','A1','K3_eta050'; ...
-    'K3_eta025_vs_K3_eta050','K3_eta050','K3_eta025'};
+function comparisons = fixedScaleComparisons(options)
+% Every configured K3 scale is compared with A0 using paired seeds.  A1,
+% if enabled, is also compared with A0 and each K3 variant.
+comparisons = cell(0,3);
+if options.includeA1
+    comparisons(end+1,:) = {'A1_vs_A0','A0','A1'}; %#ok<AGROW>
+end
+for eta = options.etas
+    id = scaleVariantId(eta);
+    comparisons(end+1,:) = {[id '_vs_A0'],'A0',id}; %#ok<AGROW>
+    if options.includeA1
+        comparisons(end+1,:) = {[id '_vs_A1'],'A1',id}; %#ok<AGROW>
+    end
+end
+if numel(options.etas) >= 2
+    referenceId = scaleVariantId(options.etas(end));
+    for eta = options.etas(1:end-1)
+        id = scaleVariantId(eta);
+        comparisons(end+1,:) = {[id '_vs_' referenceId],referenceId,id}; %#ok<AGROW>
+    end
+end
+end
+
+function id = scaleVariantId(eta)
+id = sprintf('K3_eta%03d',round(100*eta));
 end
 
 function saveOrValidateConfiguration(outputRoot,numberOfRuns,problemNumbers, ...
@@ -123,8 +169,8 @@ config = struct('totalDim',5,'upperDim',2,'lowerDim',3, ...
     'specifications',serialiseSpecifications(specifications), ...
     'comparisons',{comparisons}, ...
     'notes',['Only the auxiliary upper perturbation scale differs between ' ...
-        'K3_eta025 and K3_eta050.  A0 and A1 use eta=0.50 only as an ' ...
-        'unused runner setting because they contain no auxiliary sample.']);
+        'the configured K3 variants.  A0 and A1, if included, use eta=0.50 ' ...
+        'only as an unused runner setting because they contain no auxiliary sample.']);
 if exist(configFile,'file') ~= 2
     save(configFile,'config');
     return;
@@ -190,6 +236,9 @@ snapshotRoot = fullfile(outputRoot,'source_snapshot');
 if exist(snapshotRoot,'dir') ~= 7, mkdir(snapshotRoot); end
 files = {'BLCMAES.m','runSMDPredictionInjection.m', ...
     'runSMDFixedAuxiliaryScaleComparison.m', ...
+    'runSMDSmallAuxiliaryScaleExperiment.m', ...
+    'runSMDSmallAuxiliaryScaleFullComparison.m', ...
+    'testSmallAuxiliaryScaleFullComparison.m', ...
     'summariseFixedAuxiliaryScaleComparison.m', ...
     'analyseFixedAuxiliaryScaleMatchedBudget.m', ...
     'testFixedAuxiliaryScaleComparison.m', ...

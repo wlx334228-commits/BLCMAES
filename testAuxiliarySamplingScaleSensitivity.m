@@ -1,4 +1,4 @@
-function report = testAuxiliarySamplingScaleSensitivity(outputDir,replications)
+function report = testAuxiliarySamplingScaleSensitivity(outputDir,replications,etas)
 %TESTAUXILIARYSAMPLINGSCALESENSITIVITY Read-only sampling checks for eta.
 % Verifies A0/A1 composition, the five-plus-one-plus-two layout, exact
 % eta scaling of the auxiliary upper perturbations, and empirical standard
@@ -11,7 +11,11 @@ if nargin < 1 || isempty(outputDir)
         datestr(now,'yyyymmdd_HHMMSS'));
 end
 if nargin < 2 || isempty(replications), replications = 2000; end
+if nargin < 3 || isempty(etas), etas = [0.25,0.5,0.75,1.0]; end
 validateattributes(replications,{'numeric'},{'scalar','integer','>=',1000});
+validateattributes(etas,{'numeric'}, {'real','finite','vector','nonempty','positive'});
+etas = sort(unique(double(etas(:)')));
+assert(all(etas <= 1), 'Auxiliary sampling scales must be no greater than one.');
 if exist(outputDir,'dir') ~= 7, mkdir(outputDir); end
 
 BI = getBLOPinfo('SMD',1,5);
@@ -33,7 +37,6 @@ CMA = struct('xmean',(BI.xrange(1,:)+BI.xrange(2,:))/2, ...
 centre = CMA.xmean(1:BI.u_dim);
 rawUpper = repmat(centre,populationSize,1);
 rawLower = repmat(CMA.xmean(BI.u_dim+1:end),populationSize,1);
-etas = [0.25,0.5,0.75,1.0];
 report = struct('passed',true,'replications',replications,'etas',etas);
 
 % A0 and A1 must not depend on eta at all.
@@ -118,7 +121,8 @@ for etaIndex = 1:numel(etas)
     report.(etaField(eta)).empiricalRmsStd = standardDeviations(etaIndex);
 end
 ratios = standardDeviations / standardDeviations(end);
-assert(max(abs(ratios-etas')) < 0.06, ...
+expectedRatios = etas' / etas(end);
+assert(max(abs(ratios-expectedRatios)) < 0.06, ...
     'Empirical auxiliary standard-deviation ratios do not match eta.');
 report.empiricalRmsStdRatios = ratios;
 save(fullfile(outputDir,'auxiliary_sampling_scale_test_report.mat'), ...

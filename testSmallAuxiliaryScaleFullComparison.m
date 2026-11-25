@@ -1,0 +1,33 @@
+function report = testSmallAuxiliaryScaleFullComparison(outputRoot)
+%TESTSMALLAUXILIARYSCALEFULLCOMPARISON One-run end-to-end full-study check.
+% Verifies that the five variants are complete optimizer runs and that the
+% terminal metric files, rather than only snapshot diagnostics, are saved.
+
+projectRoot = fileparts(mfilename('fullpath'));
+addpath(projectRoot,fullfile(projectRoot,'BLEA_D'));
+if nargin < 1 || isempty(outputRoot)
+    outputRoot = fullfile(projectRoot, ...
+        'results_small_auxiliary_scale_full_comparison_tests','SMD1_1run');
+end
+experiment = runSMDSmallAuxiliaryScaleFullComparison(outputRoot,1,1);
+runs = experiment.runs;
+expected = {'A0','K3_eta010','K3_eta015','K3_eta020','K3_eta025'};
+assert(height(runs) == numel(expected), ...
+    'The one-run full study must return five terminal run records.');
+assert(isequal(sort(runs.variant)',sort(expected)), ...
+    'The full study has an unexpected variant set.');
+assert(numel(unique(runs.seed)) == 1 && all(runs.consistency_passed ~= 0), ...
+    'Full-study variants must have one paired seed and pass consistency checks.');
+assert(all(isfinite(runs.upper_error) & isfinite(runs.lower_error) & ...
+    runs.UFE > 0 & runs.LFE_total > 0), ...
+    'A full-study terminal run lacks final error or evaluation metrics.');
+assert(exist(fullfile(outputRoot,'final_scale_runs.csv'),'file') == 2 && ...
+    exist(fullfile(outputRoot,'final_scale_summary.csv'),'file') == 2 && ...
+    exist(fullfile(outputRoot,'final_scale_paired_wilcoxon.csv'),'file') == 2, ...
+    'The terminal-metric result tables were not written.');
+
+report = struct('outputRoot',outputRoot,'variants',{expected}, ...
+    'seed',runs.seed(1),'runCount',height(runs),'passed',true);
+save(fullfile(outputRoot,'small_auxiliary_scale_full_test_report.mat'),'report');
+disp(report);
+end
