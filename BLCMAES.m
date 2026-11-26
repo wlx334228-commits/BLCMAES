@@ -64,6 +64,13 @@ end
 % preceding evaluated population.  It is never consulted by the optimizer.
 POP = [];
 continuousScaleSnapshots = struct([]);
+% Opt-in, copy-only capture for offline prediction-model quality diagnostics.
+% No fitting, random draws, or diagnostic evaluations occur on the main path.
+modelQualityCapture = predictionModelQualityCapture('initialize',BI);
+if modelQualityCapture.enabled
+    assert(~any(enabledPredictionStrategies) && ~executionControl.isBranch, ...
+        'Model-quality capture requires the unmodified A0 main algorithm.');
+end
 % A branch-only, read-only diagnostic of the distribution obtained after
 % the intervention generation.  It is deliberately empty for ordinary
 % BL-CMA-ES calls and is never used by the optimizer itself.
@@ -256,6 +263,9 @@ for iter = firstIteration : maxIter
         injectionPredictionEntry = recordPredictionInjectionTrueEvaluation( ...
             injectionPredictionEntry,POP);
     end
+    if modelQualityCapture.enabled
+        modelQualityNormalPopulation = POP;
+    end
     % fitness assignment && refinement
     POP = assignUpperFitness(POP,BI);
 
@@ -370,6 +380,12 @@ for iter = firstIteration : maxIter
         elite = bestIndv;
     end
     if standardTermination && ~forceBranchContinuation
+        if modelQualityCapture.enabled
+            modelQualityCapture = predictionModelQualityCapture('append', ...
+                modelQualityCapture,CMA,POP,modelQualityNormalPopulation, ...
+                extraRefinedElite,elite,iter,ulFunctionEvaluations, ...
+                llFunctionEvaluations,false);
+        end
         % The original code does not execute updateCMAES on a terminating
         % generation.  Log its real, pre-update mean and mark that fact.
         if generationDiagnostic.enabled
@@ -448,6 +464,12 @@ for iter = firstIteration : maxIter
             ulFunctionEvaluations, llFunctionEvaluations, ...
             LFEAtGenerationStart, true, updateInfo);
     end
+    if modelQualityCapture.enabled
+        modelQualityCapture = predictionModelQualityCapture('append', ...
+            modelQualityCapture,CMA,POP,modelQualityNormalPopulation, ...
+            extraRefinedElite,elite,iter,ulFunctionEvaluations, ...
+            llFunctionEvaluations,true);
+    end
 end
 
 ins.UF = elite.UF;
@@ -457,6 +479,9 @@ ins.LX = elite.LX;
 ins.UFEs = ulFunctionEvaluations;
 ins.LFEs = llFunctionEvaluations;
 ins.record = record;
+if modelQualityCapture.enabled
+    ins.predictionModelQualityCapture = modelQualityCapture;
+end
 if meanPredictionOptions.logEnabled
     ins.predictionLog = predictionState.log;
     ins.predictionOptions = meanPredictionOptions;
