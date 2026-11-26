@@ -1,14 +1,19 @@
-function analysis = summarisePredictionModelQuality(details,outputRoot)
+function analysis = summarisePredictionModelQuality(details,outputRoot,settings)
 %SUMMARISEPREDICTIONMODELQUALITY Independent-run, paired model comparisons.
 % Generations are aggregated within a run before any inferential testing.
 if isempty(details), error('No eligible t>=10 states with a real t+1 population.'); end
 keys=unique(details(:,{'SMD','run_no','seed'}),'rows');
 ids=["QP","CP","RBF","GPR","QP_analytic"];
+if nargin<3, settings=struct(); end
+if ~isfield(settings,'prefix'), settings.prefix='prediction_model'; end
+if ~isfield(settings,'referenceId'), settings.referenceId='QP'; end
+if isfield(settings,'modelIds'), ids=string(settings.modelIds); end
 runRows=struct([]); stageRows=struct([]); pairRows=struct([]);
 for k=1:height(keys)
     run=details(details.SMD==keys.SMD(k)&details.run_no==keys.run_no(k),:);
     for model=ids
         sub=run(run.model==model,:);
+        if isempty(sub), continue; end
         runRows=append(runRows,oneRun(sub,0));
         for stage=1:3
             part=sub(sub.stage==stage,:);
@@ -18,6 +23,7 @@ for k=1:height(keys)
     for a=1:numel(ids)-1
         for b=a+1:numel(ids)
             A=run(run.model==ids(a),:); B=run(run.model==ids(b),:);
+            if isempty(A)||isempty(B), continue; end
             assert(isequal(A.generation,B.generation),'Unpaired model opportunity rows.');
             pairRows=append(pairRows,onePair(A,B));
         end
@@ -25,11 +31,19 @@ for k=1:height(keys)
 end
 runSummary=struct2table(runRows); stageRun=struct2table(stageRows);
 pairRun=struct2table(pairRows);
+if isfield(settings,'plannedPairs')
+    pairRun.family(:)="exploratory_refinement";
+    for i=1:size(settings.plannedPairs,1)
+        index=pairRun.reference_model==string(settings.plannedPairs{i,1}) & ...
+            pairRun.variant_model==string(settings.plannedPairs{i,2});
+        pairRun.family(index)="planned_refinement";
+    end
+end
 summary=aggregateModels(runSummary,false);
 stageSummary=aggregateModels(stageRun,true);
 pairwise=aggregatePairs(pairRun);
 for smd=unique(pairwise.SMD)'
-    for family=["fair_four_models","analytic_reference"]
+    for family=unique(pairwise.family)'
         index=pairwise.SMD==smd & pairwise.family==family;
         pairwise.UF_delta_p_holm(index)=holm(pairwise.UF_delta_p_raw(index));
         pairwise.win_rate_p_holm(index)=holm(pairwise.win_rate_p_raw(index));
@@ -42,12 +56,19 @@ pairwise.reference_UF_advantage=pairwise.UF_delta_p_holm<.05 & ...
 analysis=struct('runSummary',runSummary,'summary',summary, ...
     'stageRunSummary',stageRun,'stageSummary',stageSummary, ...
     'pairwiseRun',pairRun,'pairwise',pairwise);
-writetable(runSummary,fullfile(outputRoot,'prediction_model_run_summary.csv'));
-writetable(summary,fullfile(outputRoot,'prediction_model_summary.csv'));
-writetable(stageRun,fullfile(outputRoot,'prediction_model_stage_run_summary.csv'));
-writetable(stageSummary,fullfile(outputRoot,'prediction_model_stage_summary.csv'));
-writetable(pairRun,fullfile(outputRoot,'prediction_model_pairwise_run.csv'));
-writetable(pairwise,fullfile(outputRoot,'prediction_model_pairwise.csv'));
+if ~strcmp(settings.referenceId,'QP')
+    for name={'runSummary','summary','stageRunSummary','stageSummary'}
+        T=analysis.(name{1});
+        T.Properties.VariableNames=strrep(T.Properties.VariableNames,'_vs_QP',['_vs_' settings.referenceId]);
+        analysis.(name{1})=T;
+    end
+end
+writetable(analysis.runSummary,fullfile(outputRoot,[settings.prefix '_run_summary.csv']));
+writetable(analysis.summary,fullfile(outputRoot,[settings.prefix '_summary.csv']));
+writetable(analysis.stageRunSummary,fullfile(outputRoot,[settings.prefix '_stage_run_summary.csv']));
+writetable(analysis.stageSummary,fullfile(outputRoot,[settings.prefix '_stage_summary.csv']));
+writetable(pairRun,fullfile(outputRoot,[settings.prefix '_pairwise_run.csv']));
+writetable(pairwise,fullfile(outputRoot,[settings.prefix '_pairwise.csv']));
 end
 
 function row=oneRun(D,stage)
@@ -96,6 +117,10 @@ tolerance=1e-12*max(1,max(abs([A.true_UF(both),B.true_UF(both)]),[],2));
 wins=delta>tolerance; losses=delta< -tolerance; ties=~wins&~losses;
 distance=hypot(B.x_pred1(both)-A.x_pred1(both),B.x_pred2(both)-A.x_pred2(both));
 reliable=both&A.lower_precision_passed&B.lower_precision_passed;
+normalizedDelta=NaN(size(delta));
+if ismember('normalized_refinement_scale',A.Properties.VariableNames)
+    normalizedDelta=delta./A.normalized_refinement_scale(both);
+end
 family="fair_four_models";
 if A.model(1)=="QP_analytic"||B.model(1)=="QP_analytic", family="analytic_reference"; end
 row=struct('SMD',A.SMD(1),'run_no',A.run_no(1),'seed',A.seed(1), ...
@@ -106,6 +131,8 @@ row=struct('SMD',A.SMD(1),'run_no',A.run_no(1),'seed',A.seed(1), ...
     'conditional_variant_win_rate',finiteMean(double(wins)), ...
     'effective_variant_win_rate',sum(wins)/height(A), ...
     'mean_UF_delta',finiteMean(delta),'median_UF_delta',finiteMedian(delta), ...
+    'mean_normalized_UF_delta',finiteMean(normalizedDelta), ...
+    'median_normalized_UF_delta',finiteMedian(normalizedDelta), ...
     'median_pair_distance',finiteMedian(distance), ...
     'variant_good_when_reference_invalid',sum(validB&~validA&B.better_than_normal_best), ...
     'reference_good_when_variant_invalid',sum(validA&~validB&A.better_than_normal_best), ...
@@ -163,6 +190,7 @@ for i=1:height(keys)
         'mean_run_conditional_variant_win_rate',finiteMean(sub.conditional_variant_win_rate), ...
         'mean_run_effective_variant_win_rate',finiteMean(sub.effective_variant_win_rate), ...
         'median_run_UF_delta',finiteMedian(delta),'mean_run_UF_delta',finiteMean(delta), ...
+        'median_run_normalized_UF_delta',finiteMedian(sub.median_normalized_UF_delta), ...
         'median_run_pair_distance',finiteMedian(sub.median_pair_distance), ...
         'variant_good_when_reference_invalid',sum(sub.variant_good_when_reference_invalid), ...
         'reference_good_when_variant_invalid',sum(sub.reference_good_when_variant_invalid), ...

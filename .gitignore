@@ -47,6 +47,8 @@ results_large_auxiliary_scale_full_comparison_2D/
 results_large_auxiliary_scale_tests/
 results_prediction_model_quality_2D/
 results_prediction_model_quality_tests/
+results_prediction_refinement_2D/
+results_prediction_refinement_tests/
 results_population_detail/
 results_prediction_comparison(1)/
 outputs/

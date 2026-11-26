@@ -1,0 +1,71 @@
+预测点邻域历史知识再利用实验
+
+正确性测试（全新SMD1主运行，验证开关隔离、H2、曲率约束、S2与评价复用）：
+    testPredictionRefinementExperiment
+
+第一轮正式实验（SMD1--SMD8，2+3维，每题10次，S0/S1八个标签）：
+    runSMDPredictionRefinementExperiment
+
+指定输出目录、次数和问题：
+    runSMDPredictionRefinementExperiment([],1,1)
+    runSMDPredictionRefinementExperiment('D:\BLCMAES\my_refinement_results',10,1:8)
+
+S0、S1、S2通过第四个settings参数独立选择。P1始终保留为参照。
+    runSMDPredictionRefinementExperiment('my_S0_results',10,1:8, ...
+        struct('modes',{{'S0'}}))
+
+S2为第二阶段，默认不执行。先判断S0/S1结果是否支持重新筛选历史样本。
+若需要运行S2，应使用新目录；局部半径为CMA上层Mahalanobis距离除以sigma：
+    runSMDPredictionRefinementExperiment('my_S2_results',10,1:8, ...
+        struct('modes',{{'S0','S1','S2'}},'localMahalanobisRadius',1))
+
+模式/标签：
+P1：原完整二次模型，中心m，H1，原解析负定Hessian驻点和原边界处理。
+P2：同一原完整二次模型，中心P1，H2，原解析规则。
+G1/G2：原Matérn 5/2 GPR，分别使用H1/H2，参数不重新调整。
+Q1/Q2：新quadprog约束拟合，分别使用H1/H2。
+R1/R2：原r^3 RBF+线性尾项，分别使用H1/H2，参数不重新调整。
+S2标签另加_S2后缀，保留S0/S1组作对照。
+
+Q模型对原最小化目标F=-UF施加严格凸性，等价UF严格凹。
+采用对角Hessian的五系数模型（常数、两一次、两平方），没有交叉项；
+这与原完整六系数二维二次模型不同。curvatureFloorRelative默认1e-6，
+约束施加于标准化UF和公共局部输入坐标，实际Hessian也单独记录。
+
+完整档案从A0逐代真实历史行重建，每一代核对最近10代窗口与原日志一致。
+H1与H2均按原最近10代、40样本、欧氏距离、同距按档案顺序的规则筛选；
+H2只改变距离参考中心，从完整档案重新检索，不是H1重排。
+P1和其他预测点的模型预测值及真实旁路评价值都不加入档案。
+
+S0/S1不移动每个模型原有的寻优区域。
+G/R/Q沿用上一轮m中心、H1尺度的单位局部球与变量边界，
+同一状态H1/H2共用输入坐标和200个候选，均取5个模型最优起点进行fmincon。
+P1/P2保留原解析规则；原默认预测距离上限Inf，可能位于G/R/Q单位球之外。
+因此跨模型比较同时涉及模型和原有求解方式，不能视为仅改变样本中心。
+同一模型的G2/G1、Q2/Q1、R2/R1及P2/P1才是中心改变的主要对照。
+S2只使用P1邻域与每个模型原允许区域的交集，不扩大边界或原距离上限。
+
+默认可复用上一轮results_prediction_model_quality_2D中的同种子A0主运行，
+前提是维度、预算、代码及隔离审计匹配；缺少或不匹配时自动运行新A0。
+也可设置reuseMainResults=false强制新跑。没有硬编码的外部结果目录依赖。
+实际旁路评价发生于主运行完成之后。私有随机数、评价计数及完整状态隔离。
+逐元素完全相同的坐标且下层条件一致时复用评价；接近但不相同的点保留。
+所有诊断候选均不注入，不参与父代、CMA更新、历史、精英或终止判断。
+
+默认结果目录：
+    results_prediction_refinement_2D/S0_S1_SMD1_to_SMD8_10runs
+
+逐状态MAT保存模型、公共候选、H1/H2、完整历史和CMA状态。
+逐运行MAT索引和prediction_refinement_results.mat使用相对路径，搬移时应复制整个目录。
+中断后同配置重跑会跳过已保存状态，不覆盖旧实验目录。
+全部t>=10的机会和P1无效原因均保留在details/sample_analysis中；
+总体质量统计只以P1有效的全部符合条件机会为分母，并另外报告条件有效率。
+配对检验先在每次独立运行内汇总，再比较运行级UF差值中位数；
+主要7组比较在每个问题内作Holm校正，其他两两比较另作探索性校正，原始p值亦保留。
+归一化改善使用H1 UF标准差，并设1e-12*max(1,abs(H1 UF均值))的数值下界；
+原始UF差值同时保存，避免只依赖可能被放大的归一化数值。
+
+互补性中的多模型最佳、救援率及潜在父代率为事后潜力，不是在线选点效果。
+几何关系只记录，无任何距离/方向阈值筛点。零方向余弦为NaN。
+最终精度与主UFE/LFE仅属于A0，见main_summary；本轮不是八个完整优化算法对比。
+需要Statistics and Machine Learning Toolbox与Optimization Toolbox。

@@ -1,22 +1,33 @@
 function [details,result] = evaluatePredictionModelQualityState( ...
-        event,nextEvent,BI,options,smdNo,runNo,seed,stateIndex,finalUFE,firstUFE)
+        event,nextEvent,BI,options,smdNo,runNo,seed,stateIndex,finalUFE,firstUFE,prepared)
 %EVALUATEPREDICTIONMODELQUALITYSTATE Offline, matched true lower evaluations.
 % The caller's counters AND global RNG are restored, including on errors.
 global ulFunctionEvaluations llFunctionEvaluations;
 savedU=ulFunctionEvaluations; savedL=llFunctionEvaluations; savedRng=rng;
 cleanup=onCleanup(@() restoreGlobals(savedU,savedL,savedRng)); %#ok<NASGU>
+% Offline/reused main runs can leave the surrounding counters empty. Count
+% this diagnostic privately from zero, then restore even an empty caller state.
+ulFunctionEvaluations=0; llFunctionEvaluations=0;
 poolSeed=mod(seed*104729+event.generation*8191+271828,2^31-2)+1;
 lowerSeed=mod(seed*130363+event.generation*65537+314159,2^31-2)+1;
 normal=nextEvent.normalPopulation;
 normalUF=[normal.UF];
-[models,shared]=fitPredictionQualityModels(event,BI,options,poolSeed,normal);
+hasPrepared=nargin>=11 && ~isempty(prepared);
+if hasPrepared
+    models=prepared.models; shared=prepared.modelShared{1};
+else
+    [models,shared]=fitPredictionQualityModels(event,BI,options,poolSeed,normal);
+end
+rootShared=shared;
 evaluationState=struct('cma_mean',event.CMA.xmean,'sigma',event.CMA.sigma, ...
     'C',event.CMA.C,'pc',event.CMA.pc);
 rows=repmat(emptyRow(),numel(models),1); evaluations=cell(numel(models),1);
+reusedFrom=zeros(numel(models),1);
 progress=max(0,min(1,(event.UFE-firstUFE)/max(1,finalUFE-firstUFE)));
 stage=min(3,1+floor(3*progress));
 for i=1:numel(models)
     m=models(i); row=emptyRow();
+    if hasPrepared, shared=prepared.modelShared{i}; end
     row.SMD=smdNo; row.DU=BI.u_dim; row.DL=BI.l_dim;
     row.run_no=runNo; row.seed=seed; row.generation=event.generation;
     row.target_generation=nextEvent.generation; row.state_index=stateIndex;
@@ -68,8 +79,20 @@ for i=1:numel(models)
         clock=tic;
         beforeU=ulFunctionEvaluations; beforeL=llFunctionEvaluations;
         try
-            stream=RandStream('mt19937ar','Seed',lowerSeed);
-            evaluation=evaluatePredictionScaleDiagnosticCandidate(m.x,evaluationState,BI,stream);
+            duplicate=[];
+            if hasPrepared && prepared.reuseExactEvaluations
+                for previous=1:i-1
+                    if ~isempty(evaluations{previous}) && isequal(m.x,models(previous).x)
+                        duplicate=previous; break;
+                    end
+                end
+            end
+            if isempty(duplicate)
+                stream=RandStream('mt19937ar','Seed',lowerSeed);
+                evaluation=evaluatePredictionScaleDiagnosticCandidate(m.x,evaluationState,BI,stream);
+            else
+                evaluation=evaluations{duplicate}; reusedFrom(i)=duplicate;
+            end
             evaluations{i}=evaluation;
             row.evaluation_valid=all(isfinite([evaluation.UF,evaluation.LF,evaluation.xl]));
             row.true_UF=evaluation.UF; row.true_upper_objective=-evaluation.UF;
@@ -105,15 +128,20 @@ for i=1:numel(models)
 end
 qp=find(strcmp({models.id},'QP'),1);
 for i=1:numel(models)
-    if rows(i).evaluation_valid && rows(qp).evaluation_valid
+    if ~isempty(qp) && rows(i).evaluation_valid && rows(qp).evaluation_valid
         rows(i).improvement_vs_QP=rows(i).true_UF-rows(qp).true_UF;
         rows(i).distance_to_QP=norm(models(i).x-models(qp).x);
     end
 end
 details=struct2table(rows);
-result=struct('generation',event.generation,'shared',shared,'models',models, ...
+if hasPrepared
+    details.evaluation_reused=reusedFrom>0;
+    details.evaluation_reused_from=reusedFrom;
+end
+result=struct('generation',event.generation,'shared',rootShared,'models',models, ...
     'evaluations',{evaluations},'nextNormalPopulation',normal,'CMA',event.CMA, ...
     'bestUFStart',event.bestUF,'poolSeed',poolSeed,'lowerSeed',lowerSeed);
+if hasPrepared, result.modelShared=prepared.modelShared; end
 end
 
 function row=emptyRow()

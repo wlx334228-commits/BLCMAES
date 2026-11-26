@@ -1,16 +1,20 @@
-function [models,shared] = fitPredictionQualityModels(event,BI,options,seed,nextNormal)
+function [models,shared] = fitPredictionQualityModels(event,BI,options,seed,nextNormal,context)
 %FITPREDICTIONQUALITYMODELS One archive selection and search pool for all models.
 % QP/CP/RBF/GPR maximise UF, using only already evaluated history.
 % QP_analytic retains the original negative-Hessian stationary-point reference.
 ids={'QP','CP','RBF','GPR','QP_analytic'};
+if nargin<6, context=struct(); end
+if isfield(context,'modelIds'), ids=cellstr(context.modelIds); ids=ids(:)'; end
 savedRng=rng; rngCleanup=onCleanup(@() rng(savedRng)); %#ok<NASGU>
 rng(seed,'twister');
-models=repmat(emptyModel(),5,1);
-for i=1:5, models(i).id=ids{i}; end
+models=repmat(emptyModel(),numel(ids),1);
+for i=1:numel(ids), models(i).id=ids{i}; end
 meanUpper=event.CMA.xmean(1:BI.u_dim);
+selectionCentre=meanUpper;
+if isfield(context,'selectionCentre'), selectionCentre=context.selectionCentre; end
 opts=predictionInjectionOptions(BI);
 legacyClock=tic;
-legacy=fitLocalUpperQuadratic(event.history,meanUpper,event.generation,opts);
+legacy=fitLocalUpperQuadratic(event.history,selectionCentre,event.generation,opts);
 legacySeconds=toc(legacyClock);
 shared=struct('selectedSamples',legacy.selectedSamples,'scale',legacy.scale, ...
     'mean',meanUpper,'z',zeros(0,BI.u_dim),'y',zeros(0,1), ...
@@ -18,25 +22,39 @@ shared=struct('selectedSamples',legacy.selectedSamples,'scale',legacy.scale, ...
     'zUpper',NaN(1,BI.u_dim),'radius',options.localRadius, ...
     'candidateZ',zeros(0,BI.u_dim),'candidateX',zeros(0,BI.u_dim), ...
     'poolSeed',seed,'selectionReason',legacy.reason,'selectionAndQPFitSeconds',legacySeconds);
+if isfield(context,'normalizationMean'), shared.mean=context.normalizationMean; end
+if isfield(context,'normalizationScale'), shared.scale=context.normalizationScale; end
+if ~isempty(fieldnames(context))
+    shared.quadraticOrigin=selectionCentre; shared.quadraticScale=legacy.scale;
+end
+if isfield(context,'localCentreZ')
+    shared.localCentreZ=context.localCentreZ;
+    shared.localMetricZ=context.localMetricZ;
+    shared.localRadius=context.localRadius;
+end
 if size(legacy.selectedSamples,1)~=options.sampleCount || ...
         ~isfinite(legacy.scale) || legacy.scale<= ...
         opts.minScaleRelative*max(1,norm(meanUpper))
-    for i=1:5, models(i).reason=legacy.reason; end
+    for i=1:numel(models), models(i).reason=legacy.reason; end
     return;
 end
-shared.z=bsxfun(@minus,legacy.selectedSamples(:,3:4),meanUpper)/legacy.scale;
+shared.z=bsxfun(@minus,legacy.selectedSamples(:,3:4),shared.mean)/shared.scale;
 rawY=legacy.selectedSamples(:,5);
 shared.yMean=mean(rawY); shared.yScale=std(rawY);
 if ~isfinite(shared.yScale) || shared.yScale<=eps(max(1,max(abs(rawY))))
-    for i=1:5, models(i).reason='degenerate_response_scale'; end
+    for i=1:numel(models), models(i).reason='degenerate_response_scale'; end
     return;
 end
 shared.y=(rawY-shared.yMean)/shared.yScale;
-shared.zLower=(BI.u_lb-meanUpper)/legacy.scale;
-shared.zUpper=(BI.u_ub-meanUpper)/legacy.scale;
-shared.candidateZ=makeCommonPool(shared,options);
-shared.candidateX=meanUpper+legacy.scale*shared.candidateZ;
-for i=1:4
+shared.zLower=(BI.u_lb-shared.mean)/shared.scale;
+shared.zUpper=(BI.u_ub-shared.mean)/shared.scale;
+if isfield(context,'candidateZ')
+    shared.candidateZ=context.candidateZ;
+else
+    shared.candidateZ=makeCommonPool(shared,options);
+end
+shared.candidateX=shared.mean+shared.scale*shared.candidateZ;
+for i=find(~strcmp(ids,'QP_analytic'))
     m=models(i); clock=tic;
     try
         m=fitOne(m,shared,legacy,options);
@@ -44,7 +62,7 @@ for i=1:4
         m.reason=['fit_failed:' exception.identifier]; m.failureMessage=exception.message;
     end
     m.fitTime=toc(clock);
-    if i==1, m.fitTime=m.fitTime+legacySeconds; end
+    if strcmp(m.id,'QP'), m.fitTime=m.fitTime+legacySeconds; end
     if m.fitValid
         clock=tic;
         try
@@ -61,7 +79,9 @@ for i=1:4
     models(i)=m;
 end
 % Keep the legacy reference's stationary-point rule and existing upper repair.
-m=models(5); m.fitTime=0; % Already fitted once for QP; no duplicate fit cost.
+analyticIndex=find(strcmp(ids,'QP_analytic'),1);
+if ~isempty(analyticIndex)
+m=models(analyticIndex); m.fitTime=0; % Shared fit, not a second fit.
 m.fitValid=all(isfinite(legacy.coefficients));
 m.reason=legacy.reason; m.H=legacy.H;
 m.payload=struct('kind','QP','coefficients',legacy.coefficients);
@@ -71,15 +91,16 @@ if legacy.valid
     high=x>BI.u_ub; x(high)=(reference(high)+BI.u_ub(high))/2;
     low=x<BI.u_lb; x(low)=(reference(low)+BI.u_lb(low))/2;
     m.boundaryRepaired=any(high|low);
-    m.x=x; m.z=(x-meanUpper)/legacy.scale;
+    m.x=x; m.z=(x-selectionCentre)/legacy.scale;
     m.predictedUF=polyDesign(m.z,2)*legacy.coefficients;
     m.valid=all(isfinite(x))&&all(x>=BI.u_lb)&&all(x<=BI.u_ub);
     m.insideCommonRegion=norm(m.z)<=options.localRadius+1e-8;
     m.duplicateHistory=any(vecnorm(shared.z-m.z,2,2)<=options.duplicateTolerance);
     if m.valid, m.reason='valid'; else, m.reason='invalid_analytic_prediction'; end
 end
-models(5)=m;
-for i=1:5
+models(analyticIndex)=m;
+end
+for i=1:numel(models)
     if models(i).valid
         for j=1:i-1
             if models(j).valid && norm(models(i).z-models(j).z)<=options.duplicateTolerance
@@ -102,7 +123,7 @@ m=struct('id','','fitValid',false,'valid',false,'reason','not_fitted', ...
     'duplicateHistory',false,'duplicateEarlierModel',false, ...
     'duplicateOptimizerSolutions',0,'boundaryRepaired',false, ...
     'atBoundary',false,'insideCommonRegion',false,'gpMeanCheckError',NaN, ...
-    'gpWarnings','');
+    'gpWarnings','','quadprogExitFlag',NaN,'curvatureFloor',NaN);
 end
 
 function pool=makeCommonPool(shared,options)
@@ -111,8 +132,15 @@ pool=zeros(options.candidateCount,2); count=0; attempts=0;
 while count<options.candidateCount && attempts<2000
     direction=randn(stream,256,2);
     direction=direction./max(vecnorm(direction,2,2),realmin);
-    z=options.localRadius*sqrt(rand(stream,256,1)).*direction;
+    radial=sqrt(rand(stream,256,1));
+    if isfield(shared,'localCentreZ')
+        metricRoot=chol(shared.localMetricZ);
+        z=shared.localCentreZ+shared.localRadius*(radial.*direction)/metricRoot';
+    else
+        z=options.localRadius*radial.*direction;
+    end
     good=all(z>=shared.zLower & z<=shared.zUpper,2);
+    good=good & regionFeasible(z,shared,options,1e-12);
     z=z(good,:); take=min(size(z,1),options.candidateCount-count);
     pool(count+(1:take),:)=z(1:take,:); count=count+take; attempts=attempts+1;
 end
@@ -128,7 +156,16 @@ switch m.id
                 legacy.designCondition>1e10
             m.reason='invalid_quadratic_design'; return;
         end
-        coef=legacy.coefficients; coef(1)=coef(1)-s.yMean; coef=coef/s.yScale;
+        coef=legacy.coefficients;
+        if isfield(s,'quadraticOrigin') && ...
+                (s.scale~=s.quadraticScale || any(s.mean~=s.quadraticOrigin))
+            delta=(s.mean-s.quadraticOrigin)'/s.quadraticScale;
+            ratio=s.scale/s.quadraticScale; linear=coef(2:3); H=legacy.H;
+            constant=coef(1)+linear'*delta+.5*delta'*H*delta;
+            linear=ratio*(linear+H*delta); H=ratio^2*H;
+            coef=[constant;linear;H(1,1)/2;H(1,2);H(2,2)/2];
+        end
+        coef(1)=coef(1)-s.yMean; coef=coef/s.yScale;
         m.payload=struct('kind','QP','coefficients',coef);
         m.H=legacy.H; m.designRank=legacy.designRank; m.designCondition=legacy.designCondition;
     case 'CP'
@@ -166,6 +203,32 @@ switch m.id
         assert(m.gpMeanCheckError<=1e-7*max(1,max(abs(native))), ...
             'BLCMAES:GPRMeanMismatch','Cached GPR mean differs from fitrgp predict.');
         m.regularization=gp.Sigma^2;
+        distance=vecnorm(reshape(z,[],1,2)-reshape(z,1,[],2),2,3);
+        parameters=gp.KernelInformation.KernelParameters;
+        c=sqrt(5)/parameters(1);
+        kernel=parameters(2)^2*(1+c*distance+c^2*distance.^2/3).*exp(-c*distance);
+        system=kernel+gp.Sigma^2*eye(size(kernel));
+        m.designCondition=cond(system); m.designRank=rank(system);
+    case 'CURV'
+        % Strictly convex ORIGINAL minimization objective = strictly
+        % concave UF. This is a new constrained FIT, not ordinary QP search.
+        D=[ones(size(z,1),1),z,z.^2];
+        lambda=options.ridgeRelative*norm(D,'fro')^2/size(D,2);
+        penalty=diag([0 1 1 1 1]);
+        Hls=2*(D'*D+lambda*penalty);
+        upper=[Inf;Inf;Inf;-options.curvatureFloorRelative/2;-options.curvatureFloorRelative/2];
+        qpOptions=optimoptions('quadprog','Display','off','Algorithm','interior-point-convex', ...
+            'MaxIterations',200,'ConstraintTolerance',1e-10,'OptimalityTolerance',1e-10);
+        [coef,~,flag]=quadprog((Hls+Hls')/2,-2*D'*y,[],[],[],[],[],upper,[],qpOptions);
+        m.quadprogExitFlag=flag; m.curvatureFloor=options.curvatureFloorRelative;
+        if flag<=0||any(~isfinite(coef))
+            m.reason='curvature_constrained_fit_failed'; return;
+        end
+        assert(all(2*coef(4:5)<=-options.curvatureFloorRelative+1e-10), ...
+            'BLCMAES:CurvatureConstraint','Fitted UF is not strictly concave.');
+        m.payload=struct('kind','CURV','coefficients',coef);
+        m.H=diag(2*coef(4:5))*s.yScale/s.scale^2;
+        m.regularization=lambda; m.designRank=rank(D); m.designCondition=cond(Hls);
 end
 fit=valueGradient(m.payload,z);
 assert(all(isfinite(fit)),'Non-finite fitted response.');
@@ -189,12 +252,12 @@ m.optimizerFunctionCounts=zeros(5,1); m.optimizerIterations=zeros(5,1);
 for j=1:options.startCount
     [candidate,negative,flag,output]=fmincon( ...
         @(x) negativeModel(m.payload,x),m.startZ(j,:)',[],[],[],[], ...
-        s.zLower',s.zUpper',@(x) ballConstraint(x,options.localRadius),solverOptions);
+        s.zLower',s.zUpper',@(x) searchConstraints(x,s,options),solverOptions);
     candidate=candidate(:)';
     m.exitFlags(j)=flag; m.optimizerFunctionCounts(j)=output.funcCount;
     m.optimizerIterations(j)=output.iterations; m.optimizerSolutions(j,:)=candidate;
     feasible=all(isfinite(candidate))&&all(candidate>=s.zLower-1e-8) && ...
-        all(candidate<=s.zUpper+1e-8)&&norm(candidate)<=options.localRadius+1e-8;
+        all(candidate<=s.zUpper+1e-8)&&regionFeasible(candidate,s,options,1e-8);
     if flag>0 && feasible && isfinite(negative)
         m.successfulStarts=m.successfulStarts+1;
         if -negative>best
@@ -223,7 +286,7 @@ end
 function m=finishPrediction(m,s,BI,options)
 tolerance=1e-8*max(1,s.scale);
 if any(~isfinite(m.x))||any(m.x<BI.u_lb-tolerance)||any(m.x>BI.u_ub+tolerance) || ...
-        norm(m.z)>options.localRadius+1e-8
+        ~regionFeasible(m.z,s,options,1e-8)
     m.valid=false; m.reason='invalid_shared_region_prediction'; return;
 end
 m.duplicateHistory=any(vecnorm(s.z-m.z,2,2)<=options.duplicateTolerance);
@@ -237,8 +300,22 @@ function [f,g]=negativeModel(payload,x)
 f=-value; g=-gradient(:);
 end
 
-function [c,ceq,gc,gceq]=ballConstraint(x,radius)
-c=sum(x.^2)-radius^2; ceq=[]; gc=2*x(:); gceq=[];
+function [c,ceq,gc,gceq]=searchConstraints(x,s,options)
+c=sum(x.^2)-options.localRadius^2; ceq=[]; gc=2*x(:); gceq=[];
+if ~isfinite(options.localRadius), c=[]; gc=zeros(numel(x),0); end
+if isfield(s,'localCentreZ')
+    delta=x(:)-s.localCentreZ(:);
+    c=[c;delta'*s.localMetricZ*delta-s.localRadius^2];
+    gc=[gc,2*s.localMetricZ*delta];
+end
+end
+
+function good=regionFeasible(z,s,options,tolerance)
+good=sum(z.^2,2)<=options.localRadius^2+tolerance;
+if isfield(s,'localCentreZ')
+    delta=z-s.localCentreZ;
+    good=good & sum((delta*s.localMetricZ).*delta,2)<=s.localRadius^2+tolerance;
+end
 end
 
 function [value,gradient]=valueGradient(payload,z)
@@ -271,6 +348,10 @@ switch payload.kind
             factor=-variance*c^2/3*(1+c*distance').*exp(-c*distance').*payload.alpha;
             gradient=sum(factor.*(z-payload.centres),1);
         end
+    case 'CURV'
+        a=payload.coefficients;
+        value=[ones(size(z,1),1),z,z.^2]*a;
+        if nargout>1, gradient=a(2:3)'+2*a(4:5)'.*z; end
 end
 end
 
